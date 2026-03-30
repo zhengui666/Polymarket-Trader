@@ -15,10 +15,10 @@ use polymarket_core::{
     NewStateSnapshot, OpportunityCandidate, OpportunityInvalidation, OrderLifecycleRecord,
     OrderLifecycleStatus, PromotionCandidate, PromotionStage, RecoveryState, ReplayCheckpoint,
     ReplayCursor, ReplayJob, ReplayJobStatus, ReplayReport, ReplayRequest, ReplayTrace,
-    RolloutEvaluation, RolloutIncident, RolloutIncidentSeverity, RolloutPolicy,
+    RolloutEvaluation, RolloutIncident, RolloutPolicy,
     RolloutStageRecord, RuleVersion, RuntimeHealth, RuntimeMode, RuntimeModeRecord,
-    ScannerRunReport, ServiceHeartbeat, ServiceKind, SimDriftReport, SimDriftSeverity,
-    SimEventKind, SimEventRecord, SimFillRecord, SimMode, SimOrderRecord, SimRunReport,
+    ScannerRunReport, ServiceHeartbeat, ServiceKind, SimEventRecord, SimFillRecord, SimMode,
+    SimOrderRecord, SimRunReport,
     StateSnapshot, StrategyKind, TradeIntent, TradeSide,
 };
 use rusqlite::types::Type;
@@ -1581,6 +1581,48 @@ impl Store {
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(anyhow::Error::from)
         }
+    }
+
+    pub fn audit_events_in_window(
+        &self,
+        domain: Option<AccountDomain>,
+        service: Option<&str>,
+        action: Option<&str>,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>> {
+        if let Some(domain) = domain {
+            self.ensure_domain_matches(domain)?;
+        }
+
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, occurred_at, service, domain, action, detail
+            FROM audit_events
+            WHERE (?1 IS NULL OR domain = ?1)
+              AND (?2 IS NULL OR service = ?2)
+              AND (?3 IS NULL OR action = ?3)
+              AND occurred_at >= ?4
+              AND occurred_at < ?5
+            ORDER BY occurred_at DESC
+            LIMIT ?6
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![
+                domain.map(|value| value.as_str()),
+                service,
+                action,
+                start.to_rfc3339(),
+                end.to_rfc3339(),
+                limit as i64,
+            ],
+            map_audit_event,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(anyhow::Error::from)
     }
 
     pub fn resolve_alert(
@@ -3821,11 +3863,6 @@ fn parse_runtime_mode(value: &str) -> rusqlite::Result<RuntimeMode> {
 
 fn parse_promotion_stage(value: &str) -> rusqlite::Result<PromotionStage> {
     PromotionStage::from_str(value)
-        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
-}
-
-fn parse_rollout_incident_severity(value: &str) -> rusqlite::Result<RolloutIncidentSeverity> {
-    RolloutIncidentSeverity::from_str(value)
         .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
 }
 

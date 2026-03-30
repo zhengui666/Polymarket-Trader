@@ -63,6 +63,68 @@ pub struct SharedConfig {
     pub heartbeat_interval: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    pub enabled: bool,
+    pub bot_token: CredentialSource,
+    pub chat_id: CredentialSource,
+    pub daily_report_hour: u32,
+    pub daily_report_minute: u32,
+    pub timezone: String,
+}
+
+impl TelegramConfig {
+    pub fn from_map(vars: &BTreeMap<String, String>) -> Result<Self> {
+        let config = Self {
+            enabled: parse_bool(vars, "POLYMARKET_TELEGRAM_ENABLED", false)?,
+            bot_token: parse_credential_source(
+                vars,
+                "POLYMARKET_TELEGRAM_BOT_TOKEN_ENV",
+                "POLYMARKET_TELEGRAM_BOT_TOKEN_FILE",
+            )?,
+            chat_id: parse_credential_source(
+                vars,
+                "POLYMARKET_TELEGRAM_CHAT_ID_ENV",
+                "POLYMARKET_TELEGRAM_CHAT_ID_FILE",
+            )?,
+            daily_report_hour: parse_u32(vars.get("POLYMARKET_TELEGRAM_DAILY_REPORT_HOUR"), 20)?,
+            daily_report_minute: parse_u32(
+                vars.get("POLYMARKET_TELEGRAM_DAILY_REPORT_MINUTE"),
+                0,
+            )?,
+            timezone: env_or(vars, "POLYMARKET_TELEGRAM_TIMEZONE", "Asia/Shanghai"),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.daily_report_hour < 24,
+            "daily_report_hour must be within [0, 23]"
+        );
+        ensure!(
+            self.daily_report_minute < 60,
+            "daily_report_minute must be within [0, 59]"
+        );
+        ensure!(
+            !self.timezone.trim().is_empty(),
+            "telegram timezone must not be empty"
+        );
+        if self.enabled {
+            ensure!(
+                self.bot_token.is_configured(),
+                "telegram bot token must be configured when Telegram is enabled"
+            );
+            ensure!(
+                self.chat_id.is_configured(),
+                "telegram chat id must be configured when Telegram is enabled"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl SharedConfig {
     pub fn from_env(app_name: &str) -> Result<Self> {
         let mut vars = BTreeMap::new();
@@ -414,6 +476,7 @@ pub struct NodeConfig {
     pub domain_registry: DomainRegistry,
     pub selected_domain: AccountDomain,
     pub selected_domain_config: DomainConfig,
+    pub telegram: TelegramConfig,
     pub sim: SimConfig,
     pub rollout: RolloutConfig,
 }
@@ -456,6 +519,7 @@ impl NodeConfig {
             domain_registry,
             selected_domain,
             selected_domain_config,
+            telegram: TelegramConfig::from_map(vars)?,
             sim: SimConfig::from_map(selected_domain, vars)?,
             rollout: RolloutConfig::from_map(vars)?,
         })
@@ -922,6 +986,7 @@ pub struct OpportunityEngineConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionEngineConfig {
     pub api_base_url: String,
+    pub default_fee_bps: u32,
     pub heartbeat_interval: Duration,
     pub submit_timeout: Duration,
     pub cancel_timeout: Duration,
@@ -949,6 +1014,7 @@ impl ExecutionEngineConfig {
                 .get("POLYMARKET_EXECUTION_API_BASE_URL")
                 .cloned()
                 .unwrap_or_else(|| "https://clob.polymarket.com".to_owned()),
+            default_fee_bps: parse_u32(vars.get("POLYMARKET_EXECUTION_DEFAULT_FEE_BPS"), 0)?,
             heartbeat_interval: parse_duration_millis(
                 vars.get("POLYMARKET_EXECUTION_HEARTBEAT_INTERVAL_MS"),
                 5_000,

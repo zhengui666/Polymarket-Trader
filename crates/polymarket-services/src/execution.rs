@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use base64::Engine;
+use chrono::{DateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use hmac::{Hmac, Mac};
 use polymarket_config::{CredentialSource, DomainConfig, ExecutionEngineConfig};
 use polymarket_core::{
@@ -15,7 +15,6 @@ use polymarket_core::{
     NewOrderLifecycleRecord, NewStateSnapshot, OrderLifecycleRecord, OrderLifecycleStatus,
     ServiceKind, Timestamp, TradeIntent, TradeIntentBatch, TradeSide,
 };
-use polymarket_storage::Store;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,10 +22,13 @@ use sha2::{Digest, Sha256};
 use tokio::select;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::warn;
 use uuid::Uuid;
 
-use crate::{publish_heartbeat, ApprovedTradeIntentBatch, ServiceContext};
+use crate::{
+    publish_heartbeat, ApprovedTradeIntentBatch, ClosePnlNotification, DailyReportNotification,
+    NotificationEvent, ServiceContext,
+};
 
 const TOPIC_APPROVED_INTENT: &str = "trade.intent.approved";
 const TOPIC_EXECUTION_LIFECYCLE: &str = "execution.lifecycle";
@@ -122,6 +124,38 @@ struct ExecutionEngineService {
     venue: Arc<dyn ExecutionVenue>,
     operator: String,
     consecutive_heartbeat_failures: u32,
+    position_book: PositionBook,
+    daily_report_cursor: DailyReportCursor,
+    report_timezone: Tz,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PositionBook {
+    lots_by_instrument: BTreeMap<String, VecDeque<OpenLot>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenLot {
+    side: TradeSide,
+    quantity: f64,
+    average_price: f64,
+    remaining_entry_fees: f64,
+    opened_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DailyReportCursor {
+    last_report_date: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CloseComputation {
+    closed_quantity: f64,
+    entry_notional: f64,
+    exit_notional: f64,
+    gross_realized_pnl: f64,
+    entry_fees_allocated: f64,
+    exit_fees: f64,
 }
 
 impl ExecutionEngineService {
@@ -129,19 +163,34 @@ impl ExecutionEngineService {
         context: ServiceContext,
         config: ExecutionEngineConfig,
         venue: Arc<dyn ExecutionVenue>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let report_timezone = context
+            .telegram
+            .timezone
+            .parse::<Tz>()
+            .with_context(|| {
+                format!(
+                    "failed to parse POLYMARKET_TELEGRAM_TIMEZONE `{}`",
+                    context.telegram.timezone
+                )
+            })?;
+        Ok(Self {
             context,
             config,
             venue,
             operator: "execution-engine".to_owned(),
             consecutive_heartbeat_failures: 0,
-        }
+            position_book: PositionBook::default(),
+            daily_report_cursor: DailyReportCursor::default(),
+            report_timezone,
+        })
     }
 
     async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
         self.restore_recovery_state().await?;
         self.restore_latest_approved_batch().await?;
+        self.restore_position_book()?;
+        self.daily_report_cursor = self.load_daily_report_cursor()?;
 
         let mut receiver = self.context.bus.subscribe();
         let mut heartbeat = interval(self.config.heartbeat_interval);
@@ -177,10 +226,12 @@ impl ExecutionEngineService {
                 _ = heartbeat.tick() => {
                     self.process_operator_commands().await?;
                     self.perform_heartbeat().await?;
+                    self.maybe_send_daily_report().await?;
                 }
                 _ = reconcile.tick() => {
                     self.process_operator_commands().await?;
                     self.perform_reconcile().await?;
+                    self.maybe_send_daily_report().await?;
                 }
             }
         }
@@ -221,6 +272,74 @@ impl ExecutionEngineService {
                 .await?;
         }
         self.store_approved_cursor(snapshot.version)?;
+        Ok(())
+    }
+
+    fn restore_position_book(&mut self) -> Result<()> {
+        let intents = self
+            .context
+            .store
+            .list_all_execution_intents(self.context.domain)?;
+        let mut intents_by_client_order = BTreeMap::new();
+        for intent in intents {
+            intents_by_client_order.insert(intent.client_order_id.clone(), intent);
+        }
+
+        let mut orders = self.context.store.list_all_order_lifecycle(self.context.domain)?;
+        orders.sort_by_key(|order| (order.updated_at, order.order_id.clone()));
+        for order in orders.into_iter().filter(|order| order.filled_quantity > 0.0) {
+            let Some(client_order_id) = order.client_order_id.as_ref() else {
+                continue;
+            };
+            let Some(intent) = intents_by_client_order.get(client_order_id) else {
+                continue;
+            };
+            let fill_price = order
+                .average_fill_price
+                .or(order.limit_price)
+                .unwrap_or(intent.limit_price);
+            let fill_fee = estimate_fill_fee_from_transition(
+                None,
+                0.0,
+                Some(&order.detail),
+                order.filled_quantity,
+                fill_price,
+                self.config.default_fee_bps,
+            );
+            self.apply_fill_to_position_book(
+                intent,
+                order.filled_quantity,
+                fill_price,
+                fill_fee,
+                order.updated_at,
+            );
+        }
+        Ok(())
+    }
+
+    fn load_daily_report_cursor(&self) -> Result<DailyReportCursor> {
+        let snapshot = self.context.store.latest_snapshot(
+            self.context.domain,
+            "telegram_daily_report_cursor",
+            "current",
+        )?;
+        Ok(match snapshot {
+            Some(snapshot) => serde_json::from_value(snapshot.payload)
+                .context("failed to decode telegram daily report cursor")?,
+            None => DailyReportCursor::default(),
+        })
+    }
+
+    fn store_daily_report_cursor(&self) -> Result<()> {
+        self.context.store.upsert_snapshot(NewStateSnapshot {
+            domain: self.context.domain,
+            aggregate_type: "telegram_daily_report_cursor".to_owned(),
+            aggregate_id: "current".to_owned(),
+            version: now().timestamp_millis(),
+            payload: serde_json::to_value(&self.daily_report_cursor)?,
+            derived_from_sequence: None,
+            created_at: now(),
+        })?;
         Ok(())
     }
 
@@ -513,6 +632,10 @@ impl ExecutionEngineService {
             let Some(intent) = by_client_order.get(&client_order_id).cloned() else {
                 continue;
             };
+            let existing_order = self
+                .context
+                .store
+                .order_lifecycle(self.context.domain, &state.order_id)?;
             let new_status = map_order_status_to_intent_status(state.status);
             if intent.status != new_status {
                 changed += 1;
@@ -529,6 +652,43 @@ impl ExecutionEngineService {
                     &intent,
                     "state reconciled",
                 )?;
+            }
+
+            let previous_filled = existing_order
+                .as_ref()
+                .map(|order| order.filled_quantity)
+                .unwrap_or(0.0);
+            if state.filled_quantity > previous_filled + f64::EPSILON {
+                let fill_price = incremental_fill_price(
+                    previous_filled,
+                    existing_order.as_ref().and_then(|order| order.average_fill_price),
+                    state.filled_quantity,
+                    state.average_fill_price,
+                )
+                .unwrap_or_else(|| {
+                    state
+                        .average_fill_price
+                        .unwrap_or(intent.limit_price)
+                });
+                let fill_quantity = state.filled_quantity - previous_filled;
+                let fill_fee = estimate_fill_fee_from_transition(
+                    existing_order.as_ref().map(|order| &order.detail),
+                    previous_filled,
+                    Some(&state.detail),
+                    state.filled_quantity,
+                    state.average_fill_price.unwrap_or(fill_price),
+                    self.config.default_fee_bps,
+                );
+                let notifications = self.apply_fill_to_position_book(
+                    &intent,
+                    fill_quantity,
+                    fill_price,
+                    fill_fee,
+                    now(),
+                );
+                for notification in notifications {
+                    self.send_close_pnl_notification(notification).await?;
+                }
             }
             self.context
                 .store
@@ -558,6 +718,294 @@ impl ExecutionEngineService {
         }
 
         Ok(changed)
+    }
+
+    fn apply_fill_to_position_book(
+        &mut self,
+        intent: &ExecutionIntentRecord,
+        quantity: f64,
+        fill_price: f64,
+        fill_fee: f64,
+        occurred_at: Timestamp,
+    ) -> Vec<ClosePnlNotification> {
+        if quantity <= f64::EPSILON {
+            return Vec::new();
+        }
+
+        let key = instrument_key(&intent.market_id, &intent.token_id);
+        let lots = self.position_book.lots_by_instrument.entry(key).or_default();
+        let incoming_side = intent.side;
+        let fee_per_unit = fill_fee / quantity;
+        let mut remaining = quantity;
+        let mut close = CloseComputation {
+            closed_quantity: 0.0,
+            entry_notional: 0.0,
+            exit_notional: 0.0,
+            gross_realized_pnl: 0.0,
+            entry_fees_allocated: 0.0,
+            exit_fees: 0.0,
+        };
+
+        while remaining > f64::EPSILON {
+            let Some(front) = lots.front_mut() else {
+                break;
+            };
+            if front.side == incoming_side {
+                break;
+            }
+
+            let matched_quantity = front.quantity.min(remaining);
+            let entry_fee_allocated = if front.quantity > f64::EPSILON {
+                front.remaining_entry_fees * (matched_quantity / front.quantity)
+            } else {
+                0.0
+            };
+            let gross_realized_pnl = match (front.side, incoming_side) {
+                (TradeSide::Buy, TradeSide::Sell) => {
+                    (fill_price - front.average_price) * matched_quantity
+                }
+                (TradeSide::Sell, TradeSide::Buy) => {
+                    (front.average_price - fill_price) * matched_quantity
+                }
+                _ => 0.0,
+            };
+            close.closed_quantity += matched_quantity;
+            close.entry_notional += front.average_price * matched_quantity;
+            close.exit_notional += fill_price * matched_quantity;
+            close.gross_realized_pnl += gross_realized_pnl;
+            close.entry_fees_allocated += entry_fee_allocated;
+            close.exit_fees += fee_per_unit * matched_quantity;
+
+            front.quantity -= matched_quantity;
+            front.remaining_entry_fees =
+                (front.remaining_entry_fees - entry_fee_allocated).max(0.0);
+            remaining -= matched_quantity;
+
+            if front.quantity <= f64::EPSILON {
+                lots.pop_front();
+            }
+        }
+
+        if remaining > f64::EPSILON {
+            let open_fee = fee_per_unit * remaining;
+            lots.push_back(OpenLot {
+                side: incoming_side,
+                quantity: remaining,
+                average_price: fill_price,
+                remaining_entry_fees: open_fee,
+                opened_at: occurred_at,
+            });
+        }
+
+        if close.closed_quantity <= f64::EPSILON {
+            return Vec::new();
+        }
+
+        vec![ClosePnlNotification {
+            domain: self.context.domain,
+            market_id: intent.market_id.clone(),
+            token_id: intent.token_id.clone(),
+            side: incoming_side.as_str().to_owned(),
+            closed_quantity: close.closed_quantity,
+            entry_average_price: close.entry_notional / close.closed_quantity,
+            exit_average_price: close.exit_notional / close.closed_quantity,
+            gross_realized_pnl: close.gross_realized_pnl,
+            entry_fees_allocated: close.entry_fees_allocated,
+            exit_fees: close.exit_fees,
+            total_fees: close.entry_fees_allocated + close.exit_fees,
+            net_realized_pnl: close.gross_realized_pnl
+                - close.entry_fees_allocated
+                - close.exit_fees,
+            occurred_at,
+            dedupe_key: format!(
+                "{}:{}:{:.8}:{:.8}",
+                intent.client_order_id,
+                incoming_side.as_str(),
+                close.closed_quantity,
+                close.exit_notional
+            ),
+        }]
+    }
+
+    async fn send_close_pnl_notification(
+        &self,
+        notification: ClosePnlNotification,
+    ) -> Result<()> {
+        let key = format!("close-pnl:{}", notification.dedupe_key);
+        if !self.claim_notification(&key, &notification)? {
+            return Ok(());
+        }
+        let event = NotificationEvent::ClosePnl(notification.clone());
+        if let Err(error) = self.context.notifier.send(event).await {
+            self.finish_notification_claim(&key, &notification, false, Some(error.to_string()))?;
+            warn!(error = %error, "failed to send close pnl telegram notification");
+            return Ok(());
+        }
+        self.context.audit.record(
+            Some(self.context.domain),
+            ServiceKind::ExecutionEngine.as_str(),
+            "close_pnl_sent",
+            &serde_json::to_string(&notification)?,
+        )?;
+        self.finish_notification_claim(&key, &notification, true, None)?;
+        Ok(())
+    }
+
+    async fn maybe_send_daily_report(&mut self) -> Result<()> {
+        let now_local = Utc::now().with_timezone(&self.report_timezone);
+        let today = now_local.date_naive();
+        let scheduled = today
+            .and_hms_opt(
+                self.context.telegram.daily_report_hour,
+                self.context.telegram.daily_report_minute,
+                0,
+            )
+            .ok_or_else(|| anyhow!("invalid telegram daily report schedule"))?;
+        if now_local.naive_local() < scheduled {
+            return Ok(());
+        }
+
+        let today_key = today.format("%Y-%m-%d").to_string();
+        if self.daily_report_cursor.last_report_date.as_deref() == Some(today_key.as_str()) {
+            return Ok(());
+        }
+
+        let start_local = today
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| anyhow!("invalid start of day"))?;
+        let end_local = (today.succ_opt().unwrap_or(today))
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| anyhow!("invalid end of day"))?;
+        let start = local_naive_to_utc(self.report_timezone, start_local)?;
+        let end = local_naive_to_utc(self.report_timezone, end_local)?;
+
+        let closes = self.context.store.audit_events_in_window(
+            Some(self.context.domain),
+            Some(ServiceKind::ExecutionEngine.as_str()),
+            Some("close_pnl_sent"),
+            start,
+            end,
+            10_000,
+        )?;
+        let risks = self.context.store.audit_events_in_window(
+            Some(self.context.domain),
+            Some(ServiceKind::RiskEngine.as_str()),
+            Some("severe_risk_alert_sent"),
+            start,
+            end,
+            10_000,
+        )?;
+
+        let mut close_count = 0usize;
+        let mut win_count = 0usize;
+        let mut gross_realized_pnl = 0.0;
+        let mut total_fees = 0.0;
+        let mut net_realized_pnl = 0.0;
+        let mut best_trade_pnl = f64::NEG_INFINITY;
+        let mut worst_trade_pnl = f64::INFINITY;
+        for event in closes {
+            let item: ClosePnlNotification = serde_json::from_str(&event.detail)
+                .context("failed to decode close pnl audit event")?;
+            close_count += 1;
+            if item.net_realized_pnl > 0.0 {
+                win_count += 1;
+            }
+            gross_realized_pnl += item.gross_realized_pnl;
+            total_fees += item.total_fees;
+            net_realized_pnl += item.net_realized_pnl;
+            best_trade_pnl = best_trade_pnl.max(item.net_realized_pnl);
+            worst_trade_pnl = worst_trade_pnl.min(item.net_realized_pnl);
+        }
+        if close_count == 0 {
+            best_trade_pnl = 0.0;
+            worst_trade_pnl = 0.0;
+        }
+
+        let notification = DailyReportNotification {
+            domain: self.context.domain,
+            report_date: today_key.clone(),
+            timezone: self.context.telegram.timezone.clone(),
+            close_count,
+            win_count,
+            gross_realized_pnl,
+            total_fees,
+            net_realized_pnl,
+            best_trade_pnl,
+            worst_trade_pnl,
+            severe_risk_event_count: risks.len(),
+            generated_at: now(),
+        };
+        let key = format!("daily-report:{}", today_key);
+        if !self.claim_notification(&key, &notification)? {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .context
+            .notifier
+            .send(NotificationEvent::DailyReport(notification.clone()))
+            .await
+        {
+            self.finish_notification_claim(&key, &notification, false, Some(error.to_string()))?;
+            warn!(error = %error, "failed to send daily telegram report");
+            return Ok(());
+        }
+        self.context.audit.record(
+            Some(self.context.domain),
+            ServiceKind::ExecutionEngine.as_str(),
+            "daily_report_sent",
+            &serde_json::to_string(&notification)?,
+        )?;
+        self.finish_notification_claim(&key, &notification, true, None)?;
+        self.daily_report_cursor.last_report_date = Some(today_key);
+        self.store_daily_report_cursor()?;
+        Ok(())
+    }
+
+    fn claim_notification<T: Serialize>(&self, key: &str, payload: &T) -> Result<bool> {
+        let request_hash = hex_bytes(
+            &Sha256::digest(serde_json::to_vec(payload).unwrap_or_default()),
+        );
+        Ok(match self.context.store.claim_idempotency_key(NewIdempotencyKey {
+            domain: self.context.domain,
+            scope: "telegram.notification".to_owned(),
+            key: key.to_owned(),
+            request_hash,
+            created_by: self.operator.clone(),
+            created_at: now(),
+            lock_expires_at: Some(now() + chrono::Duration::seconds(30)),
+        })? {
+            IdempotencyClaimResult::Claimed(_) => true,
+            IdempotencyClaimResult::DuplicateCompleted(_)
+            | IdempotencyClaimResult::DuplicateInFlight(_) => false,
+            IdempotencyClaimResult::HashMismatch(existing) => {
+                return Err(anyhow!(
+                    "notification idempotency hash mismatch for key `{}` status={}",
+                    existing.key,
+                    existing.status
+                ));
+            }
+        })
+    }
+
+    fn finish_notification_claim<T: Serialize>(
+        &self,
+        key: &str,
+        payload: &T,
+        success: bool,
+        error: Option<String>,
+    ) -> Result<()> {
+        self.context.store.mark_idempotency_key(
+            self.context.domain,
+            "telegram.notification",
+            key,
+            &json!({
+                "success": success,
+                "error": error,
+                "payload": payload,
+            }),
+            success,
+        )?;
+        Ok(())
     }
 
     async fn process_operator_commands(&mut self) -> Result<()> {
@@ -772,7 +1220,7 @@ pub async fn run_execution_engine(
         ),
     )?;
 
-    ExecutionEngineService::new(context, config, venue)
+    ExecutionEngineService::new(context, config, venue)?
         .run(cancellation)
         .await
 }
@@ -1227,10 +1675,105 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn instrument_key(market_id: &str, token_id: &str) -> String {
+    format!("{market_id}::{token_id}")
+}
+
+fn incremental_fill_price(
+    previous_filled: f64,
+    previous_average_fill_price: Option<f64>,
+    current_filled: f64,
+    current_average_fill_price: Option<f64>,
+) -> Option<f64> {
+    let delta_quantity = current_filled - previous_filled;
+    if delta_quantity <= f64::EPSILON {
+        return None;
+    }
+    match (previous_average_fill_price, current_average_fill_price) {
+        (_, Some(current_average)) if previous_filled <= f64::EPSILON => Some(current_average),
+        (Some(previous_average), Some(current_average)) => {
+            let total_notional_before = previous_filled * previous_average;
+            let total_notional_after = current_filled * current_average;
+            Some((total_notional_after - total_notional_before) / delta_quantity)
+        }
+        _ => current_average_fill_price,
+    }
+}
+
+fn estimate_fill_fee_from_transition(
+    previous_detail: Option<&Value>,
+    previous_filled: f64,
+    current_detail: Option<&Value>,
+    current_filled: f64,
+    current_average_fill_price: f64,
+    fallback_fee_bps: u32,
+) -> f64 {
+    let previous_total_fee = previous_detail.and_then(extract_total_fee);
+    let current_total_fee = current_detail.and_then(extract_total_fee);
+    if let Some(current_total_fee) = current_total_fee {
+        if let Some(previous_total_fee) = previous_total_fee {
+            let delta = current_total_fee - previous_total_fee;
+            if delta >= 0.0 {
+                return delta;
+            }
+        }
+        if previous_filled <= f64::EPSILON {
+            return current_total_fee.max(0.0);
+        }
+    }
+    let delta_quantity = (current_filled - previous_filled).max(0.0);
+    delta_quantity * current_average_fill_price * f64::from(fallback_fee_bps) / 10_000.0
+}
+
+fn extract_total_fee(detail: &Value) -> Option<f64> {
+    const CANDIDATE_PATHS: [&[&str]; 7] = [
+        &["fees_paid"],
+        &["fee_paid"],
+        &["fee"],
+        &["total_fee"],
+        &["fees", "total"],
+        &["fee_amount"],
+        &["detail", "fees_paid"],
+    ];
+    for path in CANDIDATE_PATHS {
+        let mut current = detail;
+        let mut found = true;
+        for key in path {
+            match current.get(*key) {
+                Some(next) => current = next,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found {
+            if let Some(value) = current.as_f64() {
+                return Some(value);
+            }
+            if let Some(value) = current.as_str().and_then(|item| item.parse::<f64>().ok()) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn local_naive_to_utc(timezone: Tz, local: chrono::NaiveDateTime) -> Result<DateTime<Utc>> {
+    timezone
+        .from_local_datetime(&local)
+        .single()
+        .map(|value| value.with_timezone(&Utc))
+        .ok_or_else(|| anyhow!("failed to resolve local datetime `{local}` in timezone `{timezone}`"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polymarket_msgbus::MessageBus;
+    use polymarket_storage::Store;
     use polymarket_core::{IntentPolicy, OptimizationStatus, RuntimeMode, StrategyKind};
+    use std::time::Duration;
 
     fn sample_intent(domain: AccountDomain) -> TradeIntent {
         TradeIntent {
@@ -1274,6 +1817,9 @@ mod tests {
     #[test]
     fn live_runtime_requires_execute() {
         let domain = AccountDomain::Live;
+        let telegram = polymarket_config::TelegramConfig::from_map(&BTreeMap::new())
+            .expect("telegram config");
+        let notifier = crate::TelegramNotifier::from_config(&telegram).expect("notifier");
         let context = ServiceContext {
             domain,
             domain_config: DomainConfig {
@@ -1292,6 +1838,7 @@ mod tests {
                 execution_approved: true,
                 runtime_mode: RuntimeMode::Observe,
             },
+            telegram,
             store: Store::new("./var/live/live.sqlite", domain, "live", "domain.live"),
             bus: polymarket_msgbus::MessageBus::new(16),
             audit: Arc::new(polymarket_audit::StorageAuditSink::new(Store::new(
@@ -1300,9 +1847,106 @@ mod tests {
                 "live",
                 "domain.live",
             ))),
+            notifier: Arc::new(notifier),
             heartbeat_interval: Duration::from_secs(1),
         };
         let error = validate_intent(&context, &sample_intent(domain)).expect_err("must fail");
         assert!(error.to_string().contains("EXECUTE"));
+    }
+
+    fn test_execution_service() -> ExecutionEngineService {
+        let db_path = std::env::temp_dir().join(format!("execution-{}.sqlite", Uuid::new_v4()));
+        let store = Store::new(db_path.clone(), AccountDomain::Sim, "sim", "domain.sim");
+        store.init().expect("store init");
+        let telegram = polymarket_config::TelegramConfig::from_map(&BTreeMap::new())
+            .expect("telegram config");
+        let notifier = crate::TelegramNotifier::from_config(&telegram).expect("notifier");
+        let context = ServiceContext {
+            domain: AccountDomain::Sim,
+            domain_config: polymarket_config::NodeConfig::from_env(AccountDomain::Sim)
+                .expect("node config")
+                .selected_domain_config,
+            telegram,
+            store: store.clone(),
+            bus: MessageBus::new(16),
+            audit: Arc::new(polymarket_audit::StorageAuditSink::new(store)),
+            notifier: Arc::new(notifier),
+            heartbeat_interval: Duration::from_secs(1),
+        };
+        let mut config_vars = BTreeMap::new();
+        config_vars.insert(
+            "POLYMARKET_TELEGRAM_TIMEZONE".to_owned(),
+            "Asia/Shanghai".to_owned(),
+        );
+        ExecutionEngineService::new(
+            context,
+            ExecutionEngineConfig::from_map(&config_vars).expect("execution config"),
+            Arc::new(MockExecutionVenue),
+        )
+        .expect("service")
+    }
+
+    fn execution_record(side: TradeSide) -> ExecutionIntentRecord {
+        ExecutionIntentRecord {
+            intent_id: Uuid::new_v4(),
+            domain: AccountDomain::Sim,
+            batch_id: None,
+            strategy_kind: StrategyKind::DependencyArb,
+            market_id: "mkt-1".to_owned(),
+            token_id: "yes".to_owned(),
+            side,
+            limit_price: 0.50,
+            target_size: 10.0,
+            idempotency_key: Uuid::new_v4().to_string(),
+            client_order_id: Uuid::new_v4().to_string(),
+            status: ExecutionIntentStatus::Submitted,
+            detail: json!({ "event_id": "evt-1" }),
+            created_at: now(),
+            updated_at: now(),
+            expires_at: now() + chrono::Duration::minutes(5),
+        }
+    }
+
+    #[test]
+    fn partial_close_allocates_entry_and_exit_fees() {
+        let mut service = test_execution_service();
+        let buy = execution_record(TradeSide::Buy);
+        let sell = execution_record(TradeSide::Sell);
+
+        assert!(service
+            .apply_fill_to_position_book(&buy, 10.0, 0.40, 0.20, now())
+            .is_empty());
+        let notifications = service.apply_fill_to_position_book(&sell, 4.0, 0.55, 0.08, now());
+
+        assert_eq!(notifications.len(), 1);
+        let item = &notifications[0];
+        assert_eq!(item.closed_quantity, 4.0);
+        assert!((item.entry_fees_allocated - 0.08).abs() < 1e-9);
+        assert!((item.exit_fees - 0.08).abs() < 1e-9);
+        assert!((item.gross_realized_pnl - 0.60).abs() < 1e-9);
+        assert!((item.net_realized_pnl - 0.44).abs() < 1e-9);
+    }
+
+    #[test]
+    fn single_close_aggregates_multiple_fifo_lots() {
+        let mut service = test_execution_service();
+        let buy = execution_record(TradeSide::Buy);
+        let sell = execution_record(TradeSide::Sell);
+
+        assert!(service
+            .apply_fill_to_position_book(&buy, 3.0, 0.30, 0.03, now())
+            .is_empty());
+        assert!(service
+            .apply_fill_to_position_book(&buy, 2.0, 0.45, 0.02, now())
+            .is_empty());
+        let notifications = service.apply_fill_to_position_book(&sell, 4.0, 0.60, 0.08, now());
+
+        assert_eq!(notifications.len(), 1);
+        let item = &notifications[0];
+        assert_eq!(item.closed_quantity, 4.0);
+        assert!((item.entry_average_price - 0.3375).abs() < 1e-9);
+        assert!((item.gross_realized_pnl - 1.05).abs() < 1e-9);
+        assert!((item.total_fees - 0.12).abs() < 1e-9);
+        assert!((item.net_realized_pnl - 0.93).abs() < 1e-9);
     }
 }

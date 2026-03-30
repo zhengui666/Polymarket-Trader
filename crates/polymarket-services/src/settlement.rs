@@ -927,15 +927,18 @@ mod tests {
     }
 
     fn test_context(store: Store) -> ServiceContext {
-        let domain_config = polymarket_config::NodeConfig::from_env(AccountDomain::Sim)
-            .expect("node config")
-            .selected_domain_config;
+        let node_config =
+            polymarket_config::NodeConfig::from_env(AccountDomain::Sim).expect("node config");
+        let notifier = crate::TelegramNotifier::from_config(&node_config.telegram)
+            .expect("notifier");
         ServiceContext {
             domain: AccountDomain::Sim,
-            domain_config,
+            domain_config: node_config.selected_domain_config,
+            telegram: node_config.telegram,
             store,
             bus: MessageBus::new(32),
             audit: Arc::new(polymarket_audit::StorageAuditSink::new(temp_store())),
+            notifier: Arc::new(notifier),
             heartbeat_interval: Duration::from_secs(5),
         }
     }
@@ -1066,14 +1069,18 @@ mod tests {
     fn reconcile_pending_orders_converges_terminal_state() {
         let store = temp_store();
         let store_for_audit = store.clone();
+        let node_config =
+            polymarket_config::NodeConfig::from_env(AccountDomain::Sim).expect("node config");
+        let notifier = crate::TelegramNotifier::from_config(&node_config.telegram)
+            .expect("notifier");
         let context = ServiceContext {
             domain: AccountDomain::Sim,
-            domain_config: polymarket_config::NodeConfig::from_env(AccountDomain::Sim)
-                .expect("node config")
-                .selected_domain_config,
+            domain_config: node_config.selected_domain_config,
+            telegram: node_config.telegram,
             store: store.clone(),
             bus: MessageBus::new(16),
             audit: Arc::new(polymarket_audit::StorageAuditSink::new(store_for_audit)),
+            notifier: Arc::new(notifier),
             heartbeat_interval: Duration::from_secs(5),
         };
         let service = SettlementEngineService::new(

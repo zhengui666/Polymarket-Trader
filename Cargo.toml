@@ -27,6 +27,7 @@ async-trait = "=0.1.83"
 axum = { version = "=0.7.7", features = ["http1", "json", "tokio"] }
 base64 = "=0.22.1"
 chrono = { version = "=0.4.38", features = ["clock", "serde"] }
+chrono-tz = "=0.10.0"
 futures-util = "=0.3.31"
 hmac = "=0.12.1"
 http = "=1.1.0"

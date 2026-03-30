@@ -1,4 +1,5 @@
 pub mod execution;
+pub mod notifications;
 pub mod portfolio;
 pub mod risk;
 pub mod settlement;
@@ -6,6 +7,10 @@ pub mod sim;
 
 pub use execution::{
     run_execution_engine, ExecutionVenue, VenueHeartbeat, VenueOrderState, VenueSubmitAck,
+};
+pub use notifications::{
+    ClosePnlNotification, DailyReportNotification, Notifier, NotificationEvent, NotificationKind,
+    RiskAlertNotification, TelegramNotifier,
 };
 pub use polymarket_config::SimConfig;
 pub use polymarket_core::{SimDriftReport, SimMode, SimRunReport};
@@ -27,7 +32,7 @@ pub use sim::{
     SimEngineService, SimExchangeAdapter, SimulatedOrderOutcome, SimulatedOrderRequest,
 };
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -41,7 +46,7 @@ use polymarket_audit::{AuditSink, StorageAuditSink};
 use polymarket_common::{init_tracing, shutdown_signal};
 use polymarket_config::{
     DomainConfig, MdGatewayConfig, MdGatewayMode, NodeConfig, OpportunityEngineConfig,
-    RiskEngineConfig, RulesEngineConfig,
+    RiskEngineConfig, RulesEngineConfig, TelegramConfig,
 };
 use polymarket_core::{
     now, AccountDomain, ConstraintGraphSnapshot, DurableEvent, EventFamilySnapshot, GraphScope,
@@ -70,9 +75,11 @@ use tracing::{error, info, warn};
 pub struct ServiceContext {
     pub domain: AccountDomain,
     pub domain_config: DomainConfig,
+    pub telegram: TelegramConfig,
     pub store: Store,
     pub bus: MessageBus,
     pub audit: Arc<dyn AuditSink>,
+    pub notifier: Arc<dyn Notifier>,
     pub heartbeat_interval: Duration,
 }
 
@@ -152,6 +159,8 @@ impl NodeRuntime {
             .context("failed to persist startup runtime mode")?;
 
         let audit: Arc<dyn AuditSink> = Arc::new(StorageAuditSink::new(store.clone()));
+        let notifier: Arc<dyn Notifier> =
+            Arc::new(TelegramNotifier::from_config(&self.config.telegram)?);
         audit.record(
             Some(selected.domain()),
             "node_runtime",
@@ -169,9 +178,11 @@ impl NodeRuntime {
         Ok(ServiceContext {
             domain: selected.domain(),
             domain_config: selected.clone(),
+            telegram: self.config.telegram.clone(),
             store,
             bus: MessageBus::new(512),
             audit,
+            notifier,
             heartbeat_interval: self.config.shared.heartbeat_interval,
         })
     }
@@ -2007,6 +2018,7 @@ async fn run_risk_engine(context: ServiceContext, cancellation: CancellationToke
     let mut evaluator = interval(config.evaluation_interval);
     evaluator.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_batch_version = -1_i64;
+    let mut active_alert_keys = load_severe_risk_alert_keys(&context)?;
 
     loop {
         tokio::select! {
@@ -2036,6 +2048,7 @@ async fn run_risk_engine(context: ServiceContext, cancellation: CancellationToke
                     "runtime_evaluated",
                     &format!("mode={}", runtime.mode.as_str()),
                 )?;
+                let mut severe_notifications = build_runtime_risk_notifications(&context, &runtime);
 
                 if let Some(snapshot) = context
                     .store
@@ -2091,15 +2104,166 @@ async fn run_risk_engine(context: ServiceContext, cancellation: CancellationToke
                                         rejection.runtime_mode.as_str()
                                     ),
                                 )?;
+                                severe_notifications.extend(
+                                    build_rejection_risk_notifications(&context, rejection)
+                                );
                             }
                         }
 
                         last_batch_version = snapshot.version;
                     }
                 }
+                emit_severe_risk_alerts(&context, &mut active_alert_keys, severe_notifications).await?;
             }
         }
     }
+}
+
+fn load_severe_risk_alert_keys(context: &ServiceContext) -> Result<BTreeSet<String>> {
+    let snapshot = context.store.latest_snapshot(
+        context.domain,
+        "severe_risk_alert_keys",
+        "current",
+    )?;
+    Ok(match snapshot {
+        Some(snapshot) => snapshot_payload(&snapshot, "severe risk alert keys")?,
+        None => BTreeSet::new(),
+    })
+}
+
+fn store_severe_risk_alert_keys(
+    context: &ServiceContext,
+    keys: &BTreeSet<String>,
+) -> Result<()> {
+    context.store.upsert_snapshot(NewStateSnapshot {
+        domain: context.domain,
+        aggregate_type: "severe_risk_alert_keys".to_owned(),
+        aggregate_id: "current".to_owned(),
+        version: now().timestamp_millis(),
+        payload: serde_json::to_value(keys)?,
+        derived_from_sequence: None,
+        created_at: now(),
+    })?;
+    Ok(())
+}
+
+fn build_runtime_risk_notifications(
+    context: &ServiceContext,
+    runtime: &RuntimeDecision,
+) -> Vec<RiskAlertNotification> {
+    runtime
+        .findings
+        .iter()
+        .filter(|finding| is_severe_risk_code(finding.code))
+        .map(|finding| RiskAlertNotification {
+            domain: context.domain,
+            code: format!("{:?}", finding.code),
+            severity: if runtime.mode == RiskRuntimeMode::Safe {
+                "CRITICAL".to_owned()
+            } else {
+                "WARNING".to_owned()
+            },
+            scope: finding.scope.clone(),
+            message: finding.message.clone(),
+            current_value: None,
+            threshold: None,
+            system_action: if runtime.should_cancel_all {
+                "cancel_all / SAFE mode".to_owned()
+            } else if runtime.reduce_only {
+                "reduce_only".to_owned()
+            } else {
+                "monitor".to_owned()
+            },
+            occurred_at: runtime.evaluated_at,
+            dedupe_key: format!(
+                "runtime:{}:{}:{}",
+                context.domain,
+                format!("{:?}", finding.code),
+                finding.scope
+            ),
+        })
+        .collect()
+}
+
+fn build_rejection_risk_notifications(
+    context: &ServiceContext,
+    rejection: &RiskRejection,
+) -> Vec<RiskAlertNotification> {
+    rejection
+        .findings
+        .iter()
+        .filter(|finding| is_severe_risk_code(finding.code))
+        .map(|finding| RiskAlertNotification {
+            domain: context.domain,
+            code: format!("{:?}", finding.code),
+            severity: if rejection.runtime_mode == RiskRuntimeMode::Safe {
+                "CRITICAL".to_owned()
+            } else {
+                "WARNING".to_owned()
+            },
+            scope: finding.scope.clone(),
+            message: finding.message.clone(),
+            current_value: None,
+            threshold: None,
+            system_action: if rejection.runtime_mode == RiskRuntimeMode::Safe {
+                "batch rejected / SAFE mode".to_owned()
+            } else {
+                "batch rejected".to_owned()
+            },
+            occurred_at: rejection.rejected_at,
+            dedupe_key: format!(
+                "rejection:{}:{}:{}",
+                context.domain,
+                format!("{:?}", finding.code),
+                finding.scope
+            ),
+        })
+        .collect()
+}
+
+async fn emit_severe_risk_alerts(
+    context: &ServiceContext,
+    active_alert_keys: &mut BTreeSet<String>,
+    notifications: Vec<RiskAlertNotification>,
+) -> Result<()> {
+    let current_keys: BTreeSet<String> = notifications
+        .iter()
+        .map(|notification| notification.dedupe_key.clone())
+        .collect();
+    for notification in notifications {
+        if active_alert_keys.contains(&notification.dedupe_key) {
+            continue;
+        }
+        let event = NotificationEvent::RiskAlert(notification.clone());
+        if let Err(error) = context.notifier.send(event).await {
+            warn!(error = %error, "failed to send severe risk telegram notification");
+            continue;
+        }
+        context.audit.record(
+            Some(context.domain),
+            ServiceKind::RiskEngine.as_str(),
+            "severe_risk_alert_sent",
+            &serde_json::to_string(&notification)?,
+        )?;
+    }
+    *active_alert_keys = current_keys;
+    store_severe_risk_alert_keys(context, active_alert_keys)?;
+    Ok(())
+}
+
+fn is_severe_risk_code(code: RiskCode) -> bool {
+    matches!(
+        code,
+        RiskCode::RuntimeUnhealthy
+            | RiskCode::EngineRestarting
+            | RiskCode::DailyLossLimit
+            | RiskCode::RollingDrawdownLimit
+            | RiskCode::MarketUnsafe
+            | RiskCode::CashBufferBreach
+            | RiskCode::DisputedCapitalLimit
+            | RiskCode::UnresolvedCapitalLimit
+            | RiskCode::FeeLeakage
+    )
 }
 
 fn load_risk_context(context: &ServiceContext) -> Result<Option<RiskContext>> {
