@@ -1,0 +1,17 @@
+[package]
+name = "polymarket-rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+polymarket-core = { path = "../polymarket-core" }
+polymarket-storage = { path = "../polymarket-storage" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

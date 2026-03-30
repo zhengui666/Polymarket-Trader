@@ -1,0 +1,28 @@
+[package]
+name = "polymarket-ops-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+http.workspace = true
+polymarket-api-types = { path = "../../crates/polymarket-api-types" }
+polymarket-common = { path = "../../crates/polymarket-common" }
+polymarket-config = { path = "../../crates/polymarket-config" }
+polymarket-core = { path = "../../crates/polymarket-core" }
+polymarket-rules = { path = "../../crates/polymarket-rules" }
+polymarket-storage = { path = "../../crates/polymarket-storage" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true

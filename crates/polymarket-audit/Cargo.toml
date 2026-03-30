@@ -1,0 +1,11 @@
+[package]
+name = "polymarket-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+polymarket-core = { path = "../polymarket-core" }
+polymarket-storage = { path = "../polymarket-storage" }

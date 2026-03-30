@@ -1,0 +1,15 @@
+[package]
+name = "polymarket-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+polymarket-common = { path = "../../crates/polymarket-common" }
+polymarket-config = { path = "../../crates/polymarket-config" }
+polymarket-core = { path = "../../crates/polymarket-core" }
+polymarket-services = { path = "../../crates/polymarket-services" }
+tokio.workspace = true
+tokio-util.workspace = true

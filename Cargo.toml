@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    "crates/polymarket-api-types",
+    "crates/polymarket-audit",
+    "crates/polymarket-common",
+    "crates/polymarket-config",
+    "crates/polymarket-core",
+    "crates/polymarket-msgbus",
+    "crates/polymarket-opportunity",
+    "crates/polymarket-rules",
+    "crates/polymarket-services",
+    "crates/polymarket-storage",
+    "apps/polymarket-node",
+    "apps/polymarket-ops-api",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0-only"
+version = "0.1.0"
+rust-version = "1.83"
+
+[workspace.dependencies]
+anyhow = "=1.0.93"
+async-trait = "=0.1.83"
+axum = { version = "=0.7.7", features = ["http1", "json", "tokio"] }
+base64 = "=0.22.1"
+chrono = { version = "=0.4.38", features = ["clock", "serde"] }
+futures-util = "=0.3.31"
+hmac = "=0.12.1"
+http = "=1.1.0"
+reqwest = { version = "=0.12.9", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.31.0", features = ["bundled", "chrono"] }
+serde = { version = "=1.0.215", features = ["derive"] }
+serde_json = "=1.0.133"
+sha2 = "=0.10.8"
+tempfile = "=3.14.0"
+thiserror = "=1.0.69"
+tokio = { version = "=1.41.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "=0.24.0", features = ["rustls-tls-webpki-roots"] }
+tokio-util = "=0.7.12"
+tower = "=0.5.1"
+tower-http = { version = "=0.6.1", features = ["trace"] }
+tracing = "=0.1.40"
+tracing-subscriber = { version = "=0.3.18", features = ["env-filter", "fmt"] }
+uuid = { version = "=1.11.0", features = ["serde", "v4"] }
