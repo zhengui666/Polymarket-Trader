@@ -22,6 +22,7 @@ polymarket-opportunity = { path = "../polymarket-opportunity" }
 polymarket-rules = { path = "../polymarket-rules" }
 polymarket-storage = { path = "../polymarket-storage" }
 reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

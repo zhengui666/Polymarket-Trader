@@ -3,10 +3,12 @@ use polymarket_common::shutdown_signal;
 use polymarket_config::NodeConfig;
 use polymarket_core::AccountDomain;
 use polymarket_services::NodeRuntime;
+use rustls::crypto::aws_lc_rs;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = aws_lc_rs::default_provider().install_default();
     let domain = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("POLYMARKET_NODE_DOMAIN").ok())

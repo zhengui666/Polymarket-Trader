@@ -7,9 +7,20 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
 polymarket-common = { path = "../../crates/polymarket-common" }
 polymarket-config = { path = "../../crates/polymarket-config" }
 polymarket-core = { path = "../../crates/polymarket-core" }
+polymarket-opportunity = { path = "../../crates/polymarket-opportunity" }
 polymarket-services = { path = "../../crates/polymarket-services" }
+polymarket-storage = { path = "../../crates/polymarket-storage" }
+reqwest.workspace = true
+rustls.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tokio-util.workspace = true
+uuid.workspace = true

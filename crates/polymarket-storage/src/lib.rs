@@ -8,18 +8,16 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use polymarket_core::{
     now, AccountDomain, AlertEvent, AlertRuleKind, AlertSeverity, AlertStatus, AuditEvent,
     ConstraintEdge, ConstraintGraphSnapshot, DurableEvent, EventFamilySnapshot,
-    ExecutionIntentRecord, ExecutionIntentStatus, GraphScope, HealthMetricsSummary,
-    HealthSnapshot, IdempotencyClaimResult, IdempotencyKeyRecord, IdempotencyStatus,
-    MarketCanonical, MarketSnapshot, MetricSample, NewDurableEvent, NewIdempotencyKey,
-    NewOrderLifecycleRecord, NewReplayCheckpoint, NewSimEvent, NewSimFillRecord, NewSimOrderRecord,
-    NewStateSnapshot, OpportunityCandidate, OpportunityInvalidation, OrderLifecycleRecord,
-    OrderLifecycleStatus, PromotionCandidate, PromotionStage, RecoveryState, ReplayCheckpoint,
-    ReplayCursor, ReplayJob, ReplayJobStatus, ReplayReport, ReplayRequest, ReplayTrace,
-    RolloutEvaluation, RolloutIncident, RolloutPolicy,
-    RolloutStageRecord, RuleVersion, RuntimeHealth, RuntimeMode, RuntimeModeRecord,
+    ExecutionIntentRecord, ExecutionIntentStatus, GraphScope, HealthMetricsSummary, HealthSnapshot,
+    IdempotencyClaimResult, IdempotencyKeyRecord, IdempotencyStatus, MarketCanonical,
+    MarketSnapshot, MetricSample, NewDurableEvent, NewIdempotencyKey, NewOrderLifecycleRecord,
+    NewReplayCheckpoint, NewSimEvent, NewSimFillRecord, NewSimOrderRecord, NewStateSnapshot,
+    OpportunityCandidate, OpportunityInvalidation, OrderLifecycleRecord, OrderLifecycleStatus,
+    PromotionCandidate, PromotionStage, RecoveryState, ReplayCheckpoint, ReplayCursor, ReplayJob,
+    ReplayJobStatus, ReplayReport, ReplayRequest, ReplayTrace, RolloutEvaluation, RolloutIncident,
+    RolloutPolicy, RolloutStageRecord, RuleVersion, RuntimeHealth, RuntimeMode, RuntimeModeRecord,
     ScannerRunReport, ServiceHeartbeat, ServiceKind, SimEventRecord, SimFillRecord, SimMode,
-    SimOrderRecord, SimRunReport,
-    StateSnapshot, StrategyKind, TradeIntent, TradeSide,
+    SimOrderRecord, SimRunReport, StateSnapshot, StrategyKind, TradeIntent, TradeSide,
 };
 use rusqlite::types::Type;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
@@ -641,7 +639,9 @@ impl Store {
     ) -> Result<RolloutStageRecord> {
         self.ensure_domain_matches(domain)?;
         self.ensure_rollout_schema()?;
-        let previous_stage = self.get_current_rollout_stage(domain)?.map(|record| record.stage);
+        let previous_stage = self
+            .get_current_rollout_stage(domain)?
+            .map(|record| record.stage);
         let reason = reason.into();
         let updated_at = now();
         let connection = self.connection()?;
@@ -813,9 +813,11 @@ impl Store {
             )
             .optional()
             .map_err(anyhow::Error::from)?;
-        raw.map(|json| serde_json::from_str::<PromotionCandidate>(&json).map_err(anyhow::Error::from))
-            .transpose()
-            .map(|candidate| candidate.filter(|value| value.is_active(now())))
+        raw.map(|json| {
+            serde_json::from_str::<PromotionCandidate>(&json).map_err(anyhow::Error::from)
+        })
+        .transpose()
+        .map(|candidate| candidate.filter(|value| value.is_active(now())))
     }
 
     pub fn invalidate_promotion_candidates(
@@ -932,8 +934,13 @@ impl Store {
             .transpose()
     }
 
-    pub fn load_effective_rollout_policy(&self, domain: AccountDomain) -> Result<Option<RolloutPolicy>> {
-        let stage = self.get_current_rollout_stage(domain)?.map(|record| record.stage);
+    pub fn load_effective_rollout_policy(
+        &self,
+        domain: AccountDomain,
+    ) -> Result<Option<RolloutPolicy>> {
+        let stage = self
+            .get_current_rollout_stage(domain)?
+            .map(|record| record.stage);
         match stage {
             Some(stage) => self.load_rollout_policy(domain, stage),
             None => Ok(None),
@@ -1022,7 +1029,11 @@ impl Store {
             "#,
         )?;
         let rows = statement.query_map(
-            params![domain.as_str(), bool_to_sqlite(include_resolved), limit as i64],
+            params![
+                domain.as_str(),
+                bool_to_sqlite(include_resolved),
+                limit as i64
+            ],
             |row| {
                 let json: String = row.get(0)?;
                 serde_json::from_str::<RolloutIncident>(&json).map_err(|error| {
@@ -1272,7 +1283,11 @@ impl Store {
             .map_err(anyhow::Error::from)
     }
 
-    pub fn acknowledge_alert(&self, alert_id: Uuid, acknowledged_by: &str) -> Result<Option<AlertEvent>> {
+    pub fn acknowledge_alert(
+        &self,
+        alert_id: Uuid,
+        acknowledged_by: &str,
+    ) -> Result<Option<AlertEvent>> {
         self.ensure_observability_schema()?;
         let now = now();
         let connection = self.connection()?;
@@ -1319,7 +1334,11 @@ impl Store {
         Ok(sample)
     }
 
-    pub fn latest_metric_samples(&self, domain: AccountDomain, limit: usize) -> Result<Vec<MetricSample>> {
+    pub fn latest_metric_samples(
+        &self,
+        domain: AccountDomain,
+        limit: usize,
+    ) -> Result<Vec<MetricSample>> {
         self.ensure_domain_matches(domain)?;
         self.ensure_observability_schema()?;
         let connection = self.connection()?;
@@ -1332,7 +1351,8 @@ impl Store {
             LIMIT ?2
             "#,
         )?;
-        let rows = statement.query_map(params![domain.as_str(), limit as i64], map_metric_sample)?;
+        let rows =
+            statement.query_map(params![domain.as_str(), limit as i64], map_metric_sample)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(anyhow::Error::from)
     }
@@ -1873,6 +1893,14 @@ impl Store {
             .map_err(anyhow::Error::from)
     }
 
+    pub fn latest_research_asset(
+        &self,
+        domain: AccountDomain,
+        research_ref: &str,
+    ) -> Result<Option<StateSnapshot>> {
+        self.latest_snapshot(domain, "research_asset", research_ref)
+    }
+
     pub fn recent_snapshots(
         &self,
         domain: AccountDomain,
@@ -2195,6 +2223,44 @@ impl Store {
             "#,
         )?;
         let rows = statement.query_map(params![domain.as_str()], map_execution_intent_record)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(anyhow::Error::from)
+    }
+
+    pub fn list_all_sim_orders(&self, domain: AccountDomain) -> Result<Vec<SimOrderRecord>> {
+        self.ensure_domain_matches(domain)?;
+        self.ensure_sim_schema()?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT run_id, mode, order_id, client_order_id, market_id, status,
+                   filled_quantity, average_fill_price, detail_json, updated_at
+            FROM sim_orders
+            WHERE domain = ?1
+            ORDER BY updated_at DESC
+            "#,
+        )?;
+        let rows = statement.query_map(params![domain.as_str()], |row| {
+            let run_id: String = row.get(0)?;
+            let mode: String = row.get(1)?;
+            let status: String = row.get(5)?;
+            let detail_json: String = row.get(8)?;
+            let updated_at: String = row.get(9)?;
+            Ok(SimOrderRecord {
+                run_id: parse_uuid(&run_id)?,
+                mode: SimMode::from_str(&mode).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
+                })?,
+                order_id: row.get(2)?,
+                client_order_id: row.get(3)?,
+                market_id: row.get(4)?,
+                status: parse_order_lifecycle_status(&status)?,
+                filled_quantity: row.get(6)?,
+                average_fill_price: row.get(7)?,
+                detail: parse_json_value(&detail_json)?,
+                updated_at: parse_timestamp(&updated_at)?,
+            })
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(anyhow::Error::from)
     }

@@ -48,6 +48,7 @@ pub struct MdGatewayConfig {
     pub market_ws_url: String,
     pub user_ws_url: String,
     pub metadata_api_base_url: String,
+    pub insecure_tls: bool,
     pub metadata_refresh_interval: Duration,
     pub reconnect_backoff: Duration,
     pub heartbeat_timeout: Duration,
@@ -63,6 +64,341 @@ pub struct SharedConfig {
     pub heartbeat_interval: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTier {
+    Lite,
+    Haiku,
+    Sonnet,
+    Opus,
+}
+
+impl ModelTier {
+    pub const fn fallback_chain(self) -> &'static [Self] {
+        match self {
+            Self::Lite => &[],
+            Self::Haiku => &[Self::Lite],
+            Self::Sonnet => &[Self::Haiku, Self::Lite],
+            Self::Opus => &[Self::Sonnet, Self::Haiku, Self::Lite],
+        }
+    }
+}
+
+impl FromStr for ModelTier {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "lite" => Ok(Self::Lite),
+            "haiku" => Ok(Self::Haiku),
+            "sonnet" => Ok(Self::Sonnet),
+            "opus" => Ok(Self::Opus),
+            _ => bail!("unknown model tier `{value}`"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmTaskKind {
+    OpportunityReview,
+    TelegramSummary,
+    ResearchEnrichment,
+    PostTradeExplainer,
+    DeepResearchManual,
+}
+
+impl LlmTaskKind {
+    pub const fn env_key(self) -> &'static str {
+        match self {
+            Self::OpportunityReview => "POLYMARKET_LLM_ROUTE_OPPORTUNITY_REVIEW",
+            Self::TelegramSummary => "POLYMARKET_LLM_ROUTE_TELEGRAM_SUMMARY",
+            Self::ResearchEnrichment => "POLYMARKET_LLM_ROUTE_RESEARCH_ENRICHMENT",
+            Self::PostTradeExplainer => "POLYMARKET_LLM_ROUTE_POST_TRADE_EXPLAINER",
+            Self::DeepResearchManual => "POLYMARKET_LLM_ROUTE_DEEP_RESEARCH_MANUAL",
+        }
+    }
+
+    pub const fn default_tier(self) -> ModelTier {
+        match self {
+            Self::OpportunityReview => ModelTier::Sonnet,
+            Self::TelegramSummary => ModelTier::Haiku,
+            Self::ResearchEnrichment => ModelTier::Sonnet,
+            Self::PostTradeExplainer => ModelTier::Haiku,
+            Self::DeepResearchManual => ModelTier::Opus,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LlmModelProfile {
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model_name: String,
+}
+
+impl LlmModelProfile {
+    fn from_prefix(vars: &BTreeMap<String, String>, prefix: &str) -> Self {
+        Self {
+            provider: env_or(vars, &format!("{prefix}_PROVIDER"), ""),
+            base_url: env_or(vars, &format!("{prefix}_BASE_URL"), ""),
+            api_key: env_or(vars, &format!("{prefix}_API_KEY"), ""),
+            model_name: env_or(vars, &format!("{prefix}_MODEL_NAME"), ""),
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.provider.trim().is_empty()
+            || !self.base_url.trim().is_empty()
+            || !self.api_key.trim().is_empty()
+            || !self.model_name.trim().is_empty()
+    }
+
+    pub fn validate(&self, prefix: &str) -> Result<()> {
+        if !self.is_configured() {
+            return Ok(());
+        }
+        ensure!(
+            !self.provider.trim().is_empty(),
+            "{prefix}_PROVIDER must be configured when any tier field is set"
+        );
+        ensure!(
+            !self.base_url.trim().is_empty(),
+            "{prefix}_BASE_URL must be configured when any tier field is set"
+        );
+        ensure!(
+            !self.api_key.trim().is_empty(),
+            "{prefix}_API_KEY must be configured when any tier field is set"
+        );
+        ensure!(
+            !self.model_name.trim().is_empty(),
+            "{prefix}_MODEL_NAME must be configured when any tier field is set"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedLlmTaskConfig {
+    pub task: LlmTaskKind,
+    pub tier: ModelTier,
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model_name: String,
+    pub fallback_tiers: Vec<ModelTier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmConfig {
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model_name: String,
+    pub lite: LlmModelProfile,
+    pub haiku: LlmModelProfile,
+    pub sonnet: LlmModelProfile,
+    pub opus: LlmModelProfile,
+    pub opportunity_review_tier: ModelTier,
+    pub telegram_summary_tier: ModelTier,
+    pub research_enrichment_tier: ModelTier,
+    pub post_trade_explainer_tier: ModelTier,
+    pub deep_research_manual_tier: ModelTier,
+}
+
+impl LlmConfig {
+    pub fn from_env() -> Result<Self> {
+        let mut vars = BTreeMap::new();
+        for (key, value) in env::vars() {
+            vars.insert(key, value);
+        }
+        Self::from_map(&vars)
+    }
+
+    pub fn from_map(vars: &BTreeMap<String, String>) -> Result<Self> {
+        let config = Self {
+            provider: env_or(vars, "POLYMARKET_LLM_PROVIDER", ""),
+            base_url: env_or(vars, "POLYMARKET_LLM_BASE_URL", ""),
+            api_key: env_or(vars, "POLYMARKET_LLM_API_KEY", ""),
+            model_name: env_or(vars, "POLYMARKET_LLM_MODEL_NAME", ""),
+            lite: LlmModelProfile::from_prefix(vars, "POLYMARKET_LLM_TIER_LITE"),
+            haiku: LlmModelProfile::from_prefix(vars, "POLYMARKET_LLM_TIER_HAIKU"),
+            sonnet: LlmModelProfile::from_prefix(vars, "POLYMARKET_LLM_TIER_SONNET"),
+            opus: LlmModelProfile::from_prefix(vars, "POLYMARKET_LLM_TIER_OPUS"),
+            opportunity_review_tier: parse_model_tier(
+                vars,
+                LlmTaskKind::OpportunityReview.env_key(),
+                LlmTaskKind::OpportunityReview.default_tier(),
+            )?,
+            telegram_summary_tier: parse_model_tier(
+                vars,
+                LlmTaskKind::TelegramSummary.env_key(),
+                LlmTaskKind::TelegramSummary.default_tier(),
+            )?,
+            research_enrichment_tier: parse_model_tier(
+                vars,
+                LlmTaskKind::ResearchEnrichment.env_key(),
+                LlmTaskKind::ResearchEnrichment.default_tier(),
+            )?,
+            post_trade_explainer_tier: parse_model_tier(
+                vars,
+                LlmTaskKind::PostTradeExplainer.env_key(),
+                LlmTaskKind::PostTradeExplainer.default_tier(),
+            )?,
+            deep_research_manual_tier: parse_model_tier(
+                vars,
+                LlmTaskKind::DeepResearchManual.env_key(),
+                LlmTaskKind::DeepResearchManual.default_tier(),
+            )?,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.provider.trim().is_empty()
+            || !self.base_url.trim().is_empty()
+            || !self.api_key.trim().is_empty()
+            || !self.model_name.trim().is_empty()
+            || self.lite.is_configured()
+            || self.haiku.is_configured()
+            || self.sonnet.is_configured()
+            || self.opus.is_configured()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.is_configured() {
+            return Ok(());
+        }
+
+        if !self.provider.trim().is_empty()
+            || !self.base_url.trim().is_empty()
+            || !self.api_key.trim().is_empty()
+            || !self.model_name.trim().is_empty()
+        {
+            ensure!(
+                !self.provider.trim().is_empty(),
+                "POLYMARKET_LLM_PROVIDER must be configured when any legacy LLM setting is set"
+            );
+            ensure!(
+                !self.base_url.trim().is_empty(),
+                "POLYMARKET_LLM_BASE_URL must be configured when any legacy LLM setting is set"
+            );
+            ensure!(
+                !self.api_key.trim().is_empty(),
+                "POLYMARKET_LLM_API_KEY must be configured when any legacy LLM setting is set"
+            );
+            ensure!(
+                !self.model_name.trim().is_empty(),
+                "POLYMARKET_LLM_MODEL_NAME must be configured when any legacy LLM setting is set"
+            );
+        }
+        self.lite.validate("POLYMARKET_LLM_TIER_LITE")?;
+        self.haiku.validate("POLYMARKET_LLM_TIER_HAIKU")?;
+        self.sonnet.validate("POLYMARKET_LLM_TIER_SONNET")?;
+        self.opus.validate("POLYMARKET_LLM_TIER_OPUS")?;
+
+        Ok(())
+    }
+
+    pub fn resolve_task(&self, task: LlmTaskKind) -> Option<ResolvedLlmTaskConfig> {
+        if !self.is_configured() {
+            return None;
+        }
+        let tier = self.route_for(task);
+        let profile = self.profile_for_tier(tier)?;
+        let fallback_tiers = tier
+            .fallback_chain()
+            .iter()
+            .copied()
+            .filter(|candidate| self.profile_for_tier(*candidate).is_some())
+            .collect();
+        Some(ResolvedLlmTaskConfig {
+            task,
+            tier,
+            provider: profile.provider.clone(),
+            base_url: profile.base_url.clone(),
+            api_key: profile.api_key.clone(),
+            model_name: profile.model_name.clone(),
+            fallback_tiers,
+        })
+    }
+
+    pub fn profile_for_tier(&self, tier: ModelTier) -> Option<LlmModelProfile> {
+        let profile = match tier {
+            ModelTier::Lite => &self.lite,
+            ModelTier::Haiku => &self.haiku,
+            ModelTier::Sonnet => &self.sonnet,
+            ModelTier::Opus => &self.opus,
+        };
+        if profile.is_configured() {
+            Some(profile.clone())
+        } else if self.provider.trim().is_empty() {
+            None
+        } else {
+            Some(LlmModelProfile {
+                provider: self.provider.clone(),
+                base_url: self.base_url.clone(),
+                api_key: self.api_key.clone(),
+                model_name: self.model_name.clone(),
+            })
+        }
+    }
+
+    fn route_for(&self, task: LlmTaskKind) -> ModelTier {
+        match task {
+            LlmTaskKind::OpportunityReview => self.opportunity_review_tier,
+            LlmTaskKind::TelegramSummary => self.telegram_summary_tier,
+            LlmTaskKind::ResearchEnrichment => self.research_enrichment_tier,
+            LlmTaskKind::PostTradeExplainer => self.post_trade_explainer_tier,
+            LlmTaskKind::DeepResearchManual => self.deep_research_manual_tier,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: String,
+    pub timeout_ms: u64,
+    pub max_results: usize,
+    pub allowed_domains: BTreeSet<String>,
+    pub blocked_domains: BTreeSet<String>,
+}
+
+impl SearchConfig {
+    pub fn from_map(vars: &BTreeMap<String, String>) -> Result<Self> {
+        let config = Self {
+            enabled: parse_bool(vars, "POLYMARKET_SEARCH_ENABLED", false)?,
+            base_url: env_or(vars, "POLYMARKET_SEARCH_BASE_URL", ""),
+            api_key: env_or(vars, "POLYMARKET_SEARCH_API_KEY", ""),
+            timeout_ms: parse_u64(vars, "POLYMARKET_SEARCH_TIMEOUT_MS", 4_000)?,
+            max_results: parse_u64(vars, "POLYMARKET_SEARCH_MAX_RESULTS", 5)? as usize,
+            allowed_domains: parse_string_set(vars, "POLYMARKET_SEARCH_ALLOWED_DOMAINS"),
+            blocked_domains: parse_string_set(vars, "POLYMARKET_SEARCH_BLOCKED_DOMAINS"),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        ensure!(
+            !self.base_url.trim().is_empty(),
+            "POLYMARKET_SEARCH_BASE_URL must be configured when search is enabled"
+        );
+        ensure!(
+            self.max_results > 0,
+            "POLYMARKET_SEARCH_MAX_RESULTS must be greater than zero"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelegramConfig {
     pub enabled: bool,
@@ -71,6 +407,7 @@ pub struct TelegramConfig {
     pub daily_report_hour: u32,
     pub daily_report_minute: u32,
     pub timezone: String,
+    pub allowed_domains: BTreeSet<AccountDomain>,
 }
 
 impl TelegramConfig {
@@ -88,11 +425,16 @@ impl TelegramConfig {
                 "POLYMARKET_TELEGRAM_CHAT_ID_FILE",
             )?,
             daily_report_hour: parse_u32(vars.get("POLYMARKET_TELEGRAM_DAILY_REPORT_HOUR"), 20)?,
-            daily_report_minute: parse_u32(
-                vars.get("POLYMARKET_TELEGRAM_DAILY_REPORT_MINUTE"),
-                0,
-            )?,
+            daily_report_minute: parse_u32(vars.get("POLYMARKET_TELEGRAM_DAILY_REPORT_MINUTE"), 0)?,
             timezone: env_or(vars, "POLYMARKET_TELEGRAM_TIMEZONE", "Asia/Shanghai"),
+            allowed_domains: parse_account_domain_set(
+                vars.get("POLYMARKET_TELEGRAM_ALLOWED_DOMAINS"),
+                &[
+                    AccountDomain::Live,
+                    AccountDomain::Canary,
+                    AccountDomain::Sim,
+                ],
+            )?,
         };
         config.validate()?;
         Ok(config)
@@ -111,6 +453,10 @@ impl TelegramConfig {
             !self.timezone.trim().is_empty(),
             "telegram timezone must not be empty"
         );
+        ensure!(
+            !self.allowed_domains.is_empty(),
+            "telegram allowed domains must not be empty"
+        );
         if self.enabled {
             ensure!(
                 self.bot_token.is_configured(),
@@ -122,6 +468,20 @@ impl TelegramConfig {
             );
         }
         Ok(())
+    }
+}
+
+fn parse_account_domain_set(
+    raw: Option<&String>,
+    defaults: &[AccountDomain],
+) -> Result<BTreeSet<AccountDomain>> {
+    match raw {
+        Some(value) if !value.trim().is_empty() => value
+            .split(',')
+            .map(|part| AccountDomain::from_str(part.trim()))
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
+            .map_err(Into::into),
+        _ => Ok(defaults.iter().copied().collect()),
     }
 }
 
@@ -477,6 +837,8 @@ pub struct NodeConfig {
     pub selected_domain: AccountDomain,
     pub selected_domain_config: DomainConfig,
     pub telegram: TelegramConfig,
+    pub llm: LlmConfig,
+    pub search: SearchConfig,
     pub sim: SimConfig,
     pub rollout: RolloutConfig,
 }
@@ -520,6 +882,8 @@ impl NodeConfig {
             selected_domain,
             selected_domain_config,
             telegram: TelegramConfig::from_map(vars)?,
+            llm: LlmConfig::from_map(vars)?,
+            search: SearchConfig::from_map(vars)?,
             sim: SimConfig::from_map(selected_domain, vars)?,
             rollout: RolloutConfig::from_map(vars)?,
         })
@@ -824,7 +1188,10 @@ impl OpsApiConfig {
             target_domain,
             target_domain_config,
             monitoring: MonitoringConfig {
-                poll_interval: parse_duration_millis(vars.get("POLYMARKET_MONITOR_POLL_MS"), 5_000)?,
+                poll_interval: parse_duration_millis(
+                    vars.get("POLYMARKET_MONITOR_POLL_MS"),
+                    5_000,
+                )?,
                 alert_debounce: parse_duration_millis(
                     vars.get("POLYMARKET_MONITOR_ALERT_DEBOUNCE_MS"),
                     15_000,
@@ -834,11 +1201,7 @@ impl OpsApiConfig {
                     "POLYMARKET_MONITOR_HEARTBEAT_DEGRADED_MS",
                     12_000,
                 )?,
-                heartbeat_safe_ms: parse_u64(
-                    vars,
-                    "POLYMARKET_MONITOR_HEARTBEAT_SAFE_MS",
-                    30_000,
-                )?,
+                heartbeat_safe_ms: parse_u64(vars, "POLYMARKET_MONITOR_HEARTBEAT_SAFE_MS", 30_000)?,
                 market_ws_lag_degraded_ms: parse_u64(
                     vars,
                     "POLYMARKET_MONITOR_MARKET_WS_LAG_DEGRADED_MS",
@@ -871,15 +1234,8 @@ impl OpsApiConfig {
                     vars.get("POLYMARKET_ALERT_WEBHOOK_TIMEOUT_MS"),
                     3_000,
                 )?,
-                webhook_retries: parse_usize(
-                    vars.get("POLYMARKET_ALERT_WEBHOOK_RETRIES"),
-                    3,
-                )?,
-                prometheus_enabled: parse_bool(
-                    vars,
-                    "POLYMARKET_PROMETHEUS_ENABLED",
-                    true,
-                )?,
+                webhook_retries: parse_usize(vars.get("POLYMARKET_ALERT_WEBHOOK_RETRIES"), 3)?,
+                prometheus_enabled: parse_bool(vars, "POLYMARKET_PROMETHEUS_ENABLED", true)?,
             },
             telemetry: TelemetryConfig {
                 trace_sample_ratio: parse_f64(vars, "POLYMARKET_TRACE_SAMPLE_RATIO", 1.0)?,
@@ -1099,13 +1455,20 @@ impl MdGatewayConfig {
             user_ws_url: vars
                 .get("POLYMARKET_MD_GATEWAY_USER_WS_URL")
                 .cloned()
-                .unwrap_or_else(|| {
-                    "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_owned()
-                }),
+                .unwrap_or_else(|| "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_owned()),
             metadata_api_base_url: vars
                 .get("POLYMARKET_MD_GATEWAY_METADATA_API_BASE_URL")
                 .cloned()
                 .unwrap_or_else(|| "https://gamma-api.polymarket.com".to_owned()),
+            insecure_tls: vars
+                .get("POLYMARKET_MD_GATEWAY_INSECURE_TLS")
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false),
             metadata_refresh_interval: parse_duration_millis(
                 vars.get("POLYMARKET_MD_GATEWAY_METADATA_REFRESH_MS"),
                 60_000,
@@ -1619,7 +1982,9 @@ fn rollout_thresholds_from_map(
             default_stage_disputed_capital_max(stage),
         )?,
         max_open_critical_alerts: parse_usize(
-            vars.get(&format!("POLYMARKET_ROLLOUT_{stage_key}_MAX_OPEN_CRITICAL_ALERTS")),
+            vars.get(&format!(
+                "POLYMARKET_ROLLOUT_{stage_key}_MAX_OPEN_CRITICAL_ALERTS"
+            )),
             0,
         )?,
         max_shadow_live_drift_bps: parse_f64(
@@ -1661,7 +2026,10 @@ fn validate_rollout_policy(policy: &RolloutPolicy) -> Result<()> {
         "rollout policy `{}` batch notional must be >= strategy notional",
         policy.stage
     );
-    if matches!(policy.stage, PromotionStage::Replay | PromotionStage::Shadow) {
+    if matches!(
+        policy.stage,
+        PromotionStage::Replay | PromotionStage::Shadow
+    ) {
         ensure!(
             !policy.capabilities.allow_real_execution,
             "rollout policy `{}` cannot allow real execution",
@@ -1670,7 +2038,9 @@ fn validate_rollout_policy(policy: &RolloutPolicy) -> Result<()> {
     }
     if policy.capabilities.allow_market_making {
         ensure!(
-            policy.allowed_strategies.contains(&StrategyKind::FeeAwareMM),
+            policy
+                .allowed_strategies
+                .contains(&StrategyKind::FeeAwareMM),
             "rollout policy `{}` enables market making but does not allow FEE_AWARE_MM",
             policy.stage
         );
@@ -1814,6 +2184,30 @@ fn parse_u64(vars: &BTreeMap<String, String>, key: &str, default: u64) -> Result
             .with_context(|| format!("failed to parse `{key}` as u64")),
         None => Ok(default),
     }
+}
+
+fn parse_model_tier(
+    vars: &BTreeMap<String, String>,
+    key: &str,
+    default: ModelTier,
+) -> Result<ModelTier> {
+    match vars.get(key) {
+        Some(value) if !value.trim().is_empty() => ModelTier::from_str(value),
+        _ => Ok(default),
+    }
+}
+
+fn parse_string_set(vars: &BTreeMap<String, String>, key: &str) -> BTreeSet<String> {
+    vars.get(key)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| item.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn env_or(vars: &BTreeMap<String, String>, key: &str, default: &str) -> String {
@@ -2019,9 +2413,7 @@ mod tests {
         let canary = config.policy(PromotionStage::Canary).expect("canary");
         assert_eq!(canary.domain, AccountDomain::Canary);
         assert!(canary.capabilities.allow_real_execution);
-        assert!(!canary
-            .mvp_flags
-            .broad_market_making_allowed);
+        assert!(!canary.mvp_flags.broad_market_making_allowed);
     }
 
     #[test]
@@ -2032,8 +2424,74 @@ mod tests {
             "true".to_owned(),
         );
         let error = RolloutConfig::from_map(&vars).expect_err("must fail");
-        assert!(error
-            .to_string()
-            .contains("cannot allow real execution"));
+        assert!(error.to_string().contains("cannot allow real execution"));
+    }
+
+    #[test]
+    fn llm_config_resolves_route_and_fallbacks() {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "POLYMARKET_LLM_TIER_HAIKU_PROVIDER".to_owned(),
+            "openai".to_owned(),
+        );
+        vars.insert(
+            "POLYMARKET_LLM_TIER_HAIKU_BASE_URL".to_owned(),
+            "http://haiku.test/v1".to_owned(),
+        );
+        vars.insert(
+            "POLYMARKET_LLM_TIER_HAIKU_API_KEY".to_owned(),
+            "haiku-key".to_owned(),
+        );
+        vars.insert(
+            "POLYMARKET_LLM_TIER_HAIKU_MODEL_NAME".to_owned(),
+            "haiku-model".to_owned(),
+        );
+        vars.insert(
+            "POLYMARKET_LLM_TIER_SONNET_PROVIDER".to_owned(),
+            "openai".to_owned(),
+        );
+        vars.insert(
+            "POLYMARKET_LLM_TIER_SONNET_BASE_URL".to_owned(),
+            "http://sonnet.test/v1".to_owned(),
+        );
+        vars.insert(
+            "POLYMARKET_LLM_TIER_SONNET_API_KEY".to_owned(),
+            "sonnet-key".to_owned(),
+        );
+        vars.insert(
+            "POLYMARKET_LLM_TIER_SONNET_MODEL_NAME".to_owned(),
+            "sonnet-model".to_owned(),
+        );
+
+        let config = LlmConfig::from_map(&vars).expect("llm config");
+        let resolved = config
+            .resolve_task(LlmTaskKind::OpportunityReview)
+            .expect("resolved route");
+        assert_eq!(resolved.tier, ModelTier::Sonnet);
+        assert_eq!(resolved.model_name, "sonnet-model");
+        assert_eq!(resolved.fallback_tiers, vec![ModelTier::Haiku]);
+    }
+
+    #[test]
+    fn search_config_parses_domain_filters() {
+        let mut vars = BTreeMap::new();
+        vars.insert("POLYMARKET_SEARCH_ENABLED".to_owned(), "true".to_owned());
+        vars.insert(
+            "POLYMARKET_SEARCH_BASE_URL".to_owned(),
+            "http://searxng.local".to_owned(),
+        );
+        vars.insert(
+            "POLYMARKET_SEARCH_ALLOWED_DOMAINS".to_owned(),
+            "Reuters.com, example.org ".to_owned(),
+        );
+        vars.insert(
+            "POLYMARKET_SEARCH_BLOCKED_DOMAINS".to_owned(),
+            "spam.test".to_owned(),
+        );
+
+        let config = SearchConfig::from_map(&vars).expect("search config");
+        assert!(config.allowed_domains.contains("reuters.com"));
+        assert!(config.allowed_domains.contains("example.org"));
+        assert!(config.blocked_domains.contains("spam.test"));
     }
 }

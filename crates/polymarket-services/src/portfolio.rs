@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::Duration as ChronoDuration;
 use polymarket_core::{
-    now, AccountDomain, AllocationPlan, IntentPolicy, OpportunityCandidate, OptimizationStatus,
+    AccountDomain, AllocationPlan, IntentPolicy, OpportunityCandidate, OptimizationStatus,
     PortfolioRejectReason, PortfolioSnapshot, RiskBudgetSnapshot, RuntimeHealth, StrategyKind,
     TradeIntent, TradeIntentBatch, TradeSide,
 };
@@ -890,6 +890,7 @@ fn build_intent(
         expires_at,
         strategy_kind: candidate.opportunity.opportunity.strategy,
         thesis_ref: candidate.opportunity.opportunity.thesis_ref.clone(),
+        research_ref: candidate.opportunity.opportunity.research_ref.clone(),
         opportunity_id: candidate.opportunity.opportunity.opportunity_id,
         event_id: candidate.opportunity.opportunity.event_id.clone(),
     }
@@ -960,7 +961,7 @@ mod tests {
         RuntimeHealth {
             domain: AccountDomain::Canary,
             runtime_mode: "SHADOW".to_owned(),
-            now: now(),
+            now: polymarket_core::now(),
             market_ws_lag_ms: 100,
             user_ws_ok: true,
             heartbeat_age_ms: 100,
@@ -1028,9 +1029,11 @@ mod tests {
                 capital_lock_days: 1.0,
                 needs_multileg: false,
                 thesis_ref: format!("thesis-{suffix}"),
+                research_ref: None,
+                llm_review: None,
                 graph_version: 1,
-                book_observed_at: now(),
-                created_at: now(),
+                book_observed_at: polymarket_core::now(),
+                created_at: polymarket_core::now(),
                 invalidated_at: None,
                 invalidation_reason: None,
             },

@@ -1,11 +1,11 @@
 use polymarket_core::{
     AccountDomain, AlertEvent, AlertSeverity, AlertStatus, AuditEvent, ConstraintEdge,
     ConstraintGraphSnapshot, EventFamilySnapshot, ExecutionHeartbeat, ExecutionIntentRecord,
-    ExecutionReconcileReport, HealthSnapshot, MarketCanonical, MetricSample,
-    OpportunityCandidate, OpportunityInvalidation, OrderLifecycleRecord, PromotionCandidate,
-    PromotionStage, ReplayJob, ReplayReport, ReplayTrace, RolloutEvaluation, RolloutIncident,
-    RolloutPolicy, RolloutStageRecord, RuleVersion, RuntimeMode, RuntimeModeRecord,
-    ScannerRunReport, ServiceHeartbeat,
+    ExecutionReconcileReport, HealthSnapshot, MarketCanonical, MetricSample, OpportunityCandidate,
+    OpportunityInvalidation, OrderLifecycleRecord, PromotionCandidate, PromotionStage, ReplayJob,
+    ReplayReport, ReplayTrace, RolloutEvaluation, RolloutIncident, RolloutPolicy,
+    RolloutStageRecord, RuleVersion, RuntimeMode, RuntimeModeRecord, ScannerRunReport,
+    ServiceHeartbeat,
 };
 use serde::{Deserialize, Serialize};
 
@@ -129,6 +129,12 @@ pub struct OpportunityResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpportunitiesResponse {
     pub opportunities: Vec<OpportunityCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchAssetResponse {
+    pub research_ref: String,
+    pub asset: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

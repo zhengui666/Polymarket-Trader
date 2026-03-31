@@ -436,7 +436,6 @@ pub struct AuditEvent {
     pub detail: String,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AlertSeverity {
@@ -1655,6 +1654,8 @@ pub struct OpportunityCandidate {
     pub capital_lock_days: f32,
     pub needs_multileg: bool,
     pub thesis_ref: String,
+    pub research_ref: Option<String>,
+    pub llm_review: Option<serde_json::Value>,
     pub graph_version: i64,
     pub book_observed_at: Timestamp,
     pub created_at: Timestamp,
@@ -2120,6 +2121,7 @@ pub struct TradeIntent {
     pub expires_at: Timestamp,
     pub strategy_kind: StrategyKind,
     pub thesis_ref: String,
+    pub research_ref: Option<String>,
     pub opportunity_id: Uuid,
     pub event_id: String,
 }
@@ -2408,7 +2410,10 @@ mod tests {
     #[test]
     fn promotion_stage_neighbors_are_stable() {
         assert_eq!(PromotionStage::Replay.next(), Some(PromotionStage::Shadow));
-        assert_eq!(PromotionStage::Shadow.previous(), Some(PromotionStage::Replay));
+        assert_eq!(
+            PromotionStage::Shadow.previous(),
+            Some(PromotionStage::Replay)
+        );
         assert!(PromotionStage::Canary.is_reachable_from(PromotionStage::Shadow));
         assert!(!PromotionStage::Live.is_reachable_from(PromotionStage::Replay));
         assert_eq!(PromotionStage::Live.next(), None);

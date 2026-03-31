@@ -70,6 +70,7 @@ struct SettlementCommandCursor {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct SettlementCycleOutcome {
     positions: Vec<SettlementPositionSnapshot>,
     tasks: Vec<SettlementTask>,
@@ -929,12 +930,15 @@ mod tests {
     fn test_context(store: Store) -> ServiceContext {
         let node_config =
             polymarket_config::NodeConfig::from_env(AccountDomain::Sim).expect("node config");
-        let notifier = crate::TelegramNotifier::from_config(&node_config.telegram)
-            .expect("notifier");
+        let notifier =
+            crate::TelegramNotifier::from_config(&node_config.telegram).expect("notifier");
         ServiceContext {
             domain: AccountDomain::Sim,
             domain_config: node_config.selected_domain_config,
             telegram: node_config.telegram,
+            llm: polymarket_config::LlmConfig::from_map(&BTreeMap::new()).expect("llm config"),
+            search: polymarket_config::SearchConfig::from_map(&BTreeMap::new())
+                .expect("search config"),
             store,
             bus: MessageBus::new(32),
             audit: Arc::new(polymarket_audit::StorageAuditSink::new(temp_store())),
@@ -955,6 +959,7 @@ mod tests {
             expires_at: now(),
             strategy_kind: StrategyKind::DependencyArb,
             thesis_ref: "test".to_owned(),
+            research_ref: None,
             opportunity_id: Uuid::new_v4(),
             event_id: "event-1".to_owned(),
         }
@@ -1071,12 +1076,15 @@ mod tests {
         let store_for_audit = store.clone();
         let node_config =
             polymarket_config::NodeConfig::from_env(AccountDomain::Sim).expect("node config");
-        let notifier = crate::TelegramNotifier::from_config(&node_config.telegram)
-            .expect("notifier");
+        let notifier =
+            crate::TelegramNotifier::from_config(&node_config.telegram).expect("notifier");
         let context = ServiceContext {
             domain: AccountDomain::Sim,
             domain_config: node_config.selected_domain_config,
             telegram: node_config.telegram,
+            llm: polymarket_config::LlmConfig::from_map(&BTreeMap::new()).expect("llm config"),
+            search: polymarket_config::SearchConfig::from_map(&BTreeMap::new())
+                .expect("search config"),
             store: store.clone(),
             bus: MessageBus::new(16),
             audit: Arc::new(polymarket_audit::StorageAuditSink::new(store_for_audit)),

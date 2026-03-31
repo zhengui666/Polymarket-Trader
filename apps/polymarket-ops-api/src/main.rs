@@ -12,26 +12,24 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use polymarket_api_types::{
-    AlertAckResponse, AlertQueryResponse, ApiEnvelope, AuditEventsResponse, ConstraintGraphResponse,
-    EventFamilyResponse, ExecutionActionResponse, ExecutionHealthResponse,
+    AlertAckResponse, AlertQueryResponse, ApiEnvelope, AuditEventsResponse,
+    ConstraintGraphResponse, EventFamilyResponse, ExecutionActionResponse, ExecutionHealthResponse,
     ExecutionIntentsResponse, ExecutionOrdersResponse, ExecutionReconcileResponse, HealthResponse,
     OpportunitiesResponse, OpportunityResponse, ReplayJobStatusResponse, ReplayRunResponse,
     ReplayRunsResponse, ReplayTraceResponse, ReplayTriggerRequest, ReplayTriggerResponse,
-    RolloutEvaluationResponse, RolloutEvaluationsResponse, RolloutIncidentsResponse,
-    RolloutPolicyResponse, RolloutPromoteRequest, RolloutRollbackRequest, RolloutStatusResponse,
-    RuleVersionsResponse, RulesMarketResponse, RuntimeModeUpdateRequest, RuntimeModesResponse,
-    ScannerRunResponse, ScannerRunsResponse, ServicesResponse,
+    ResearchAssetResponse, RolloutEvaluationResponse, RolloutEvaluationsResponse,
+    RolloutIncidentsResponse, RolloutPolicyResponse, RolloutPromoteRequest, RolloutRollbackRequest,
+    RolloutStatusResponse, RuleVersionsResponse, RulesMarketResponse, RuntimeModeUpdateRequest,
+    RuntimeModesResponse, ScannerRunResponse, ScannerRunsResponse, ServicesResponse,
 };
 use polymarket_common::init_tracing_with_sampling;
 use polymarket_config::{MonitoringConfig, OpsApiConfig, RolloutConfig};
 use polymarket_core::{
     now, AccountDomain, AlertEvent, AlertRuleKind, AlertSeverity, AlertStatus, ExecutionCommand,
     ExecutionCommandKind, ExecutionHeartbeat, ExecutionReconcileReport, GraphScope,
-    MdGatewayRuntime,
-    MetricSample, NewDurableEvent, NewStateSnapshot, PromotionCandidate, PromotionStage,
-    ReplayJob, ReplayRequest, RolloutEvaluation, RolloutEvidence, RolloutGuardrail,
-    RolloutIncident, RolloutIncidentSeverity, RolloutPolicy, RuntimeHealth, RuntimeMode,
-    StrategyKind,
+    MdGatewayRuntime, MetricSample, NewDurableEvent, NewStateSnapshot, PromotionCandidate,
+    PromotionStage, ReplayJob, ReplayRequest, RolloutEvaluation, RolloutEvidence, RolloutGuardrail,
+    RolloutIncident, RolloutIncidentSeverity, RuntimeHealth, RuntimeMode, StrategyKind,
 };
 use polymarket_rules::build_replay_report;
 use polymarket_storage::Store;
@@ -50,7 +48,6 @@ struct AppState {
     rollout: RolloutConfig,
     alert_webhook: Option<String>,
     prometheus_enabled: bool,
-    webhook_timeout: Duration,
     webhook_retries: usize,
     http_client: reqwest::Client,
 }
@@ -143,7 +140,6 @@ async fn main() -> Result<()> {
         rollout: config.rollout.clone(),
         alert_webhook: config.alerting.webhook_url.clone(),
         prometheus_enabled: config.alerting.prometheus_enabled,
-        webhook_timeout: config.alerting.webhook_timeout,
         webhook_retries: config.alerting.webhook_retries,
         http_client: reqwest::Client::builder()
             .timeout(config.alerting.webhook_timeout)
@@ -197,11 +193,18 @@ fn build_app(state: AppState) -> Router {
         .route("/opportunities/:opportunity_id", get(get_opportunity))
         .route("/opportunities/scanner-runs", get(list_scanner_runs))
         .route("/opportunities/scanner-runs/:run_id", get(get_scanner_run))
+        .route("/research/:research_ref", get(get_research_asset))
         .route("/rollout/:domain", get(get_rollout_status))
         .route("/rollout/:domain/policy", get(get_rollout_policy))
-        .route("/rollout/:domain/evaluations", get(list_rollout_evaluations))
+        .route(
+            "/rollout/:domain/evaluations",
+            get(list_rollout_evaluations),
+        )
         .route("/rollout/:domain/incidents", get(list_rollout_incidents))
-        .route("/rollout/:domain/evaluate", post(trigger_rollout_evaluation))
+        .route(
+            "/rollout/:domain/evaluate",
+            post(trigger_rollout_evaluation),
+        )
         .route("/rollout/:domain/promote", post(promote_rollout_stage))
         .route("/rollout/:domain/rollback", post(rollback_rollout_stage))
         .route_layer(middleware::from_fn_with_state(
@@ -222,12 +225,17 @@ fn sync_rollout_policies(state: &AppState) -> Result<()> {
     for stage in PromotionStage::PATH {
         let mut policy = state.rollout.policy(stage)?.clone();
         policy.domain = state.target_domain;
-        state.store.upsert_rollout_policy(state.target_domain, &policy)?;
+        state
+            .store
+            .upsert_rollout_policy(state.target_domain, &policy)?;
     }
     Ok(())
 }
 
-fn current_rollout_stage(state: &AppState, domain: AccountDomain) -> Result<polymarket_core::RolloutStageRecord> {
+fn current_rollout_stage(
+    state: &AppState,
+    domain: AccountDomain,
+) -> Result<polymarket_core::RolloutStageRecord> {
     Ok(state
         .store
         .get_current_rollout_stage(domain)?
@@ -262,7 +270,10 @@ fn build_rollout_guardrail(
     }
 }
 
-fn evaluate_rollout_for_domain(state: &AppState, domain: AccountDomain) -> Result<RolloutEvaluation> {
+fn evaluate_rollout_for_domain(
+    state: &AppState,
+    domain: AccountDomain,
+) -> Result<RolloutEvaluation> {
     sync_rollout_policies(state)?;
     let current_stage = current_rollout_stage(state, domain)?;
     let policy = state
@@ -284,14 +295,22 @@ fn evaluate_rollout_for_domain(state: &AppState, domain: AccountDomain) -> Resul
         .unwrap_or(collect_runtime_health(state)?);
     let critical_alerts = state
         .store
-        .list_alerts(domain, Some(AlertStatus::Open), Some(AlertSeverity::Critical), 200)?
+        .list_alerts(
+            domain,
+            Some(AlertStatus::Open),
+            Some(AlertSeverity::Critical),
+            200,
+        )?
         .len();
     let recent_alert = state
         .store
         .list_alerts(domain, None, None, 1)?
         .into_iter()
         .next();
-    let unresolved_incidents = state.store.list_rollout_incidents(domain, false, 200)?.len();
+    let unresolved_incidents = state
+        .store
+        .list_rollout_incidents(domain, false, 200)?
+        .len();
     let threshold = state.rollout.threshold(current_stage.stage)?;
     let stable_window_secs = health
         .stable_since
@@ -444,27 +463,25 @@ fn evaluate_rollout_for_domain(state: &AppState, domain: AccountDomain) -> Resul
     state.store.record_rollout_evaluation(evaluation.clone())?;
     if evaluation.eligible {
         let target_stage = evaluation.target_stage.expect("eligible target stage");
-        state
-            .store
-            .upsert_promotion_candidate(PromotionCandidate {
-                candidate_id: Uuid::new_v4(),
-                domain,
-                current_stage: current_stage.stage,
-                target_stage,
-                evidence_summary: format!(
-                    "stable_window={}s heartbeat={}ms reject_rate={:.4} fill_rate={:.4}",
-                    evaluation.evidence.stable_window_secs,
-                    evaluation.evidence.heartbeat_age_ms,
-                    evaluation.evidence.reject_rate_5m,
-                    evaluation.evidence.fill_rate_5m
-                ),
-                blocking_reasons: evaluation.warnings.clone(),
-                valid_until: evaluation.evaluated_at
-                    + chrono::Duration::from_std(threshold.candidate_ttl)
-                        .unwrap_or_else(|_| chrono::Duration::minutes(5)),
-                created_at: evaluation.evaluated_at,
-                invalidated_at: None,
-            })?;
+        state.store.upsert_promotion_candidate(PromotionCandidate {
+            candidate_id: Uuid::new_v4(),
+            domain,
+            current_stage: current_stage.stage,
+            target_stage,
+            evidence_summary: format!(
+                "stable_window={}s heartbeat={}ms reject_rate={:.4} fill_rate={:.4}",
+                evaluation.evidence.stable_window_secs,
+                evaluation.evidence.heartbeat_age_ms,
+                evaluation.evidence.reject_rate_5m,
+                evaluation.evidence.fill_rate_5m
+            ),
+            blocking_reasons: evaluation.warnings.clone(),
+            valid_until: evaluation.evaluated_at
+                + chrono::Duration::from_std(threshold.candidate_ttl)
+                    .unwrap_or_else(|_| chrono::Duration::minutes(5)),
+            created_at: evaluation.evaluated_at,
+            invalidated_at: None,
+        })?;
     } else {
         state
             .store
@@ -500,7 +517,10 @@ fn maybe_auto_rollback(
         previous_stage,
         None,
         None,
-        format!("automatic rollback from {} due to rollout blockers", current_stage.stage),
+        format!(
+            "automatic rollback from {} due to rollout blockers",
+            current_stage.stage
+        ),
     )?;
     state
         .store
@@ -526,7 +546,10 @@ fn maybe_auto_rollback(
     state.store.set_runtime_mode(
         current_stage.domain,
         runtime_mode,
-        format!("rollout auto rollback from {} to {}", current_stage.stage, previous_stage),
+        format!(
+            "rollout auto rollback from {} to {}",
+            current_stage.stage, previous_stage
+        ),
     )?;
     let _ = enqueue_execution_command(
         &state.store,
@@ -912,9 +935,11 @@ fn evaluate_runtime_alerts(state: &AppState, health: &RuntimeHealth) -> Result<V
             now_ts,
         ));
     } else {
-        let _ = state
-            .store
-            .resolve_alert(health.domain, "USER_WS_DISCONNECTED", "user websocket recovered");
+        let _ = state.store.resolve_alert(
+            health.domain,
+            "USER_WS_DISCONNECTED",
+            "user websocket recovered",
+        );
     }
     if health.reconcile_drift {
         alerts.push(new_alert(
@@ -928,9 +953,10 @@ fn evaluate_runtime_alerts(state: &AppState, health: &RuntimeHealth) -> Result<V
             now_ts,
         ));
     } else {
-        let _ = state
-            .store
-            .resolve_alert(health.domain, "RECONCILE_DRIFT", "reconcile drift cleared");
+        let _ =
+            state
+                .store
+                .resolve_alert(health.domain, "RECONCILE_DRIFT", "reconcile drift cleared");
     }
     Ok(alerts)
 }
@@ -1030,12 +1056,7 @@ async fn dispatch_alert_webhook(state: &AppState, alert: &AlertEvent) -> Result<
         return Ok(());
     };
     for attempt in 0..state.webhook_retries.max(1) {
-        let response = state
-            .http_client
-            .post(url)
-            .json(alert)
-            .send()
-            .await;
+        let response = state.http_client.post(url).json(alert).send().await;
         match response {
             Ok(result) if result.status().is_success() => return Ok(()),
             Ok(_) | Err(_) if attempt + 1 < state.webhook_retries.max(1) => continue,
@@ -1075,7 +1096,10 @@ async fn metrics(State(state): State<AppState>) -> Response {
     match render_metrics(&state) {
         Ok(body) => (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
             body,
         )
             .into_response(),
@@ -1304,7 +1328,10 @@ async fn list_execution_intents(
 ) -> Result<Json<ApiEnvelope<ExecutionIntentsResponse>>, StatusCode> {
     let intents = state
         .store
-        .list_execution_intents(ensure_target_domain(&state, &domain)?, query.limit.unwrap_or(100).min(500))
+        .list_execution_intents(
+            ensure_target_domain(&state, &domain)?,
+            query.limit.unwrap_or(100).min(500),
+        )
         .map_err(internal_error)?;
     Ok(Json(ApiEnvelope {
         data: ExecutionIntentsResponse { intents },
@@ -1619,6 +1646,23 @@ async fn get_opportunity(
     }))
 }
 
+async fn get_research_asset(
+    State(state): State<AppState>,
+    Path(research_ref): Path<String>,
+) -> Result<Json<ApiEnvelope<ResearchAssetResponse>>, StatusCode> {
+    let asset = state
+        .store
+        .latest_research_asset(state.target_domain, &research_ref)
+        .map_err(internal_error)?
+        .map(|snapshot| snapshot.payload);
+    Ok(Json(ApiEnvelope {
+        data: ResearchAssetResponse {
+            research_ref,
+            asset,
+        },
+    }))
+}
+
 async fn list_scanner_runs(
     State(state): State<AppState>,
     Query(query): Query<OpportunitiesQuery>,
@@ -1771,7 +1815,8 @@ async fn promote_rollout_stage(
         .get_active_promotion_candidate(domain)
         .map_err(internal_error)?
         .ok_or(StatusCode::CONFLICT)?;
-    if candidate.current_stage != current.stage || current.stage.next() != Some(candidate.target_stage)
+    if candidate.current_stage != current.stage
+        || current.stage.next() != Some(candidate.target_stage)
     {
         return Err(StatusCode::CONFLICT);
     }
@@ -1958,10 +2003,13 @@ fn render_metrics(state: &AppState) -> Result<String> {
         .store
         .latest_metric_samples(state.target_domain, 128)?
         .into_iter()
-        .fold(BTreeMap::<String, MetricSample>::new(), |mut acc, sample| {
-            acc.entry(sample.metric_key.clone()).or_insert(sample);
-            acc
-        });
+        .fold(
+            BTreeMap::<String, MetricSample>::new(),
+            |mut acc, sample| {
+                acc.entry(sample.metric_key.clone()).or_insert(sample);
+                acc
+            },
+        );
     let open_alerts = state
         .store
         .list_alerts(state.target_domain, Some(AlertStatus::Open), None, 500)?
@@ -1971,8 +2019,7 @@ fn render_metrics(state: &AppState) -> Result<String> {
         "# TYPE polymarket_alerts_open gauge".to_owned(),
         format!(
             "polymarket_alerts_open{{domain=\"{}\"}} {}",
-            state.target_domain,
-            open_alerts
+            state.target_domain, open_alerts
         ),
     ];
     for (key, sample) in metrics {
@@ -2080,16 +2127,6 @@ impl OperatorAuthenticator {
         }
     }
 
-    fn from_parts(auth_tokens: BTreeMap<String, String>, legacy_token: Option<String>) -> Self {
-        Self {
-            operators: auth_tokens
-                .into_iter()
-                .map(|(name, token)| (Arc::<str>::from(name), Arc::<str>::from(token)))
-                .collect(),
-            legacy_token: legacy_token.map(Arc::<str>::from),
-        }
-    }
-
     fn authenticate(&self, headers: &HeaderMap) -> Option<OperatorIdentity> {
         let actual = headers
             .get(header::AUTHORIZATION)
@@ -2131,7 +2168,13 @@ mod tests {
         auth.insert("bob".to_owned(), "token-b".to_owned());
         AppState {
             store,
-            authenticator: Arc::new(OperatorAuthenticator::from_parts(auth, None)),
+            authenticator: Arc::new(OperatorAuthenticator {
+                operators: auth
+                    .into_iter()
+                    .map(|(name, token)| (Arc::<str>::from(name), Arc::<str>::from(token)))
+                    .collect(),
+                legacy_token: None,
+            }),
             target_domain: AccountDomain::Sim,
             replay_worker_ready: Arc::new(AtomicBool::new(true)),
             monitoring_ready: Arc::new(AtomicBool::new(true)),
@@ -2149,7 +2192,6 @@ mod tests {
             rollout: RolloutConfig::from_map(&BTreeMap::new()).expect("rollout config"),
             alert_webhook: None,
             prometheus_enabled: true,
-            webhook_timeout: Duration::from_secs(1),
             webhook_retries: 1,
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(1))

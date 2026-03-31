@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use polymarket_config::RiskEngineConfig;
 use polymarket_core::{
-    now, IntentPolicy, OptimizationStatus, PortfolioSnapshot, PromotionStage, RolloutPolicy,
-    RiskBudgetSnapshot, RuntimeHealth, StrategyKind, Timestamp, TradeIntent, TradeIntentBatch,
+    now, IntentPolicy, OptimizationStatus, PortfolioSnapshot, PromotionStage, RiskBudgetSnapshot,
+    RolloutPolicy, RuntimeHealth, StrategyKind, Timestamp, TradeIntent, TradeIntentBatch,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1097,6 +1097,7 @@ mod tests {
             expires_at: Utc::now() + ChronoDuration::minutes(10),
             strategy_kind: StrategyKind::RulesDriven,
             thesis_ref: "thesis-1".to_owned(),
+            research_ref: None,
             opportunity_id: Uuid::new_v4(),
             event_id: "e1".to_owned(),
         }

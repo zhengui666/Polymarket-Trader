@@ -1,6 +1,3 @@
-use std::collections::{BTreeMap, VecDeque};
-use std::str::FromStr;
-use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use base64::Engine;
@@ -19,6 +16,9 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, VecDeque};
+use std::str::FromStr;
+use std::sync::Arc;
 use tokio::select;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -122,6 +122,8 @@ struct ExecutionEngineService {
     context: ServiceContext,
     config: ExecutionEngineConfig,
     venue: Arc<dyn ExecutionVenue>,
+    fee_rate_http: reqwest::Client,
+    fee_rate_cache: BTreeMap<String, u32>,
     operator: String,
     consecutive_heartbeat_failures: u32,
     position_book: PositionBook,
@@ -164,20 +166,22 @@ impl ExecutionEngineService {
         config: ExecutionEngineConfig,
         venue: Arc<dyn ExecutionVenue>,
     ) -> Result<Self> {
-        let report_timezone = context
-            .telegram
-            .timezone
-            .parse::<Tz>()
-            .with_context(|| {
-                format!(
-                    "failed to parse POLYMARKET_TELEGRAM_TIMEZONE `{}`",
-                    context.telegram.timezone
-                )
-            })?;
+        let fee_rate_timeout = config.submit_timeout;
+        let report_timezone = context.telegram.timezone.parse::<Tz>().with_context(|| {
+            format!(
+                "failed to parse POLYMARKET_TELEGRAM_TIMEZONE `{}`",
+                context.telegram.timezone
+            )
+        })?;
         Ok(Self {
             context,
             config,
             venue,
+            fee_rate_http: reqwest::Client::builder()
+                .timeout(fee_rate_timeout)
+                .build()
+                .context("failed to build fee-rate client")?,
+            fee_rate_cache: BTreeMap::new(),
             operator: "execution-engine".to_owned(),
             consecutive_heartbeat_failures: 0,
             position_book: PositionBook::default(),
@@ -243,11 +247,11 @@ impl ExecutionEngineService {
             self.process_trade_intent(intent, Some(batch.created_at))
                 .await?;
         }
-        if let Some(snapshot) = self
-            .context
-            .store
-            .latest_snapshot(self.context.domain, "approved_trade_intent_batch", "latest")?
-        {
+        if let Some(snapshot) = self.context.store.latest_snapshot(
+            self.context.domain,
+            "approved_trade_intent_batch",
+            "latest",
+        )? {
             self.store_approved_cursor(snapshot.version)?;
         }
         Ok(())
@@ -255,10 +259,11 @@ impl ExecutionEngineService {
 
     async fn restore_latest_approved_batch(&mut self) -> Result<()> {
         let cursor = self.load_approved_cursor()?;
-        let Some(snapshot) = self
-            .context
-            .store
-            .latest_snapshot(self.context.domain, "approved_trade_intent_batch", "latest")?
+        let Some(snapshot) = self.context.store.latest_snapshot(
+            self.context.domain,
+            "approved_trade_intent_batch",
+            "latest",
+        )?
         else {
             return Ok(());
         };
@@ -285,9 +290,15 @@ impl ExecutionEngineService {
             intents_by_client_order.insert(intent.client_order_id.clone(), intent);
         }
 
-        let mut orders = self.context.store.list_all_order_lifecycle(self.context.domain)?;
+        let mut orders = self
+            .context
+            .store
+            .list_all_order_lifecycle(self.context.domain)?;
         orders.sort_by_key(|order| (order.updated_at, order.order_id.clone()));
-        for order in orders.into_iter().filter(|order| order.filled_quantity > 0.0) {
+        for order in orders
+            .into_iter()
+            .filter(|order| order.filled_quantity > 0.0)
+        {
             let Some(client_order_id) = order.client_order_id.as_ref() else {
                 continue;
             };
@@ -304,7 +315,11 @@ impl ExecutionEngineService {
                 Some(&order.detail),
                 order.filled_quantity,
                 fill_price,
-                self.config.default_fee_bps,
+                fallback_fee_bps(
+                    Some(&order.detail),
+                    Some(&intent.detail),
+                    self.config.default_fee_bps,
+                ),
             );
             self.apply_fill_to_position_book(
                 intent,
@@ -379,6 +394,7 @@ impl ExecutionEngineService {
             }
         }
 
+        let fee_bps = self.resolve_fee_bps(&intent.token_id).await;
         let record = self.context.store.record_execution_intent(
             &intent,
             intent_id,
@@ -390,6 +406,8 @@ impl ExecutionEngineService {
                 "event_id": intent.event_id,
                 "policy": intent.policy,
                 "thesis_ref": intent.thesis_ref,
+                "research_ref": intent.research_ref,
+                "fee_bps": fee_bps,
             }),
         )?;
         self.publish_lifecycle(ExecutionEventKind::Accepted, &record, "intent accepted")?;
@@ -421,12 +439,14 @@ impl ExecutionEngineService {
         let ack = acks.into_iter().next().ok_or_else(|| {
             ExecutionError::VenueRejected("submit_batch returned no ack".to_owned())
         })?;
+        let fee_bps = extract_fee_bps(&record.detail).unwrap_or(self.config.default_fee_bps);
+        let ack_detail = with_fee_bps(ack.detail.clone(), fee_bps);
         self.context
             .store
             .upsert_execution_state(ExecutionIntentRecord {
                 status: map_order_status_to_intent_status(ack.status),
                 updated_at: now(),
-                detail: ack.detail.clone(),
+                detail: ack_detail.clone(),
                 ..record.clone()
             })
             .map_err(|error| ExecutionError::StateConflict(error.to_string()))?;
@@ -446,6 +466,8 @@ impl ExecutionEngineService {
                 metadata: json!({
                     "market_id": record.market_id,
                     "client_order_id": record.client_order_id,
+                    "token_id": record.token_id,
+                    "fee_bps": fee_bps,
                 }),
                 created_at: now(),
             })
@@ -467,7 +489,7 @@ impl ExecutionEngineService {
                 filled_quantity: 0.0,
                 average_fill_price: None,
                 last_event_sequence: Some(durable.sequence),
-                detail: ack.detail.clone(),
+                detail: ack_detail,
                 opened_at: record.created_at,
                 updated_at: now(),
                 closed_at: if ack.status.is_terminal() {
@@ -661,15 +683,13 @@ impl ExecutionEngineService {
             if state.filled_quantity > previous_filled + f64::EPSILON {
                 let fill_price = incremental_fill_price(
                     previous_filled,
-                    existing_order.as_ref().and_then(|order| order.average_fill_price),
+                    existing_order
+                        .as_ref()
+                        .and_then(|order| order.average_fill_price),
                     state.filled_quantity,
                     state.average_fill_price,
                 )
-                .unwrap_or_else(|| {
-                    state
-                        .average_fill_price
-                        .unwrap_or(intent.limit_price)
-                });
+                .unwrap_or_else(|| state.average_fill_price.unwrap_or(intent.limit_price));
                 let fill_quantity = state.filled_quantity - previous_filled;
                 let fill_fee = estimate_fill_fee_from_transition(
                     existing_order.as_ref().map(|order| &order.detail),
@@ -677,7 +697,11 @@ impl ExecutionEngineService {
                     Some(&state.detail),
                     state.filled_quantity,
                     state.average_fill_price.unwrap_or(fill_price),
-                    self.config.default_fee_bps,
+                    fallback_fee_bps(
+                        Some(&state.detail),
+                        Some(&intent.detail),
+                        self.config.default_fee_bps,
+                    ),
                 );
                 let notifications = self.apply_fill_to_position_book(
                     &intent,
@@ -733,7 +757,11 @@ impl ExecutionEngineService {
         }
 
         let key = instrument_key(&intent.market_id, &intent.token_id);
-        let lots = self.position_book.lots_by_instrument.entry(key).or_default();
+        let lots = self
+            .position_book
+            .lots_by_instrument
+            .entry(key)
+            .or_default();
         let incoming_side = intent.side;
         let fee_per_unit = fill_fee / quantity;
         let mut remaining = quantity;
@@ -827,10 +855,7 @@ impl ExecutionEngineService {
         }]
     }
 
-    async fn send_close_pnl_notification(
-        &self,
-        notification: ClosePnlNotification,
-    ) -> Result<()> {
+    async fn send_close_pnl_notification(&self, notification: ClosePnlNotification) -> Result<()> {
         let key = format!("close-pnl:{}", notification.dedupe_key);
         if !self.claim_notification(&key, &notification)? {
             return Ok(());
@@ -962,29 +987,34 @@ impl ExecutionEngineService {
     }
 
     fn claim_notification<T: Serialize>(&self, key: &str, payload: &T) -> Result<bool> {
-        let request_hash = hex_bytes(
-            &Sha256::digest(serde_json::to_vec(payload).unwrap_or_default()),
-        );
-        Ok(match self.context.store.claim_idempotency_key(NewIdempotencyKey {
-            domain: self.context.domain,
-            scope: "telegram.notification".to_owned(),
-            key: key.to_owned(),
-            request_hash,
-            created_by: self.operator.clone(),
-            created_at: now(),
-            lock_expires_at: Some(now() + chrono::Duration::seconds(30)),
-        })? {
-            IdempotencyClaimResult::Claimed(_) => true,
-            IdempotencyClaimResult::DuplicateCompleted(_)
-            | IdempotencyClaimResult::DuplicateInFlight(_) => false,
-            IdempotencyClaimResult::HashMismatch(existing) => {
-                return Err(anyhow!(
-                    "notification idempotency hash mismatch for key `{}` status={}",
-                    existing.key,
-                    existing.status
-                ));
-            }
-        })
+        let request_hash = hex_bytes(&Sha256::digest(
+            serde_json::to_vec(payload).unwrap_or_default(),
+        ));
+        Ok(
+            match self
+                .context
+                .store
+                .claim_idempotency_key(NewIdempotencyKey {
+                    domain: self.context.domain,
+                    scope: "telegram.notification".to_owned(),
+                    key: key.to_owned(),
+                    request_hash,
+                    created_by: self.operator.clone(),
+                    created_at: now(),
+                    lock_expires_at: Some(now() + chrono::Duration::seconds(30)),
+                })? {
+                IdempotencyClaimResult::Claimed(_) => true,
+                IdempotencyClaimResult::DuplicateCompleted(_)
+                | IdempotencyClaimResult::DuplicateInFlight(_) => false,
+                IdempotencyClaimResult::HashMismatch(existing) => {
+                    return Err(anyhow!(
+                        "notification idempotency hash mismatch for key `{}` status={}",
+                        existing.key,
+                        existing.status
+                    ));
+                }
+            },
+        )
     }
 
     fn finish_notification_claim<T: Serialize>(
@@ -1193,6 +1223,31 @@ impl ExecutionEngineService {
             created_at: now(),
         })?;
         Ok(())
+    }
+
+    async fn resolve_fee_bps(&mut self, token_id: &str) -> u32 {
+        if token_id.trim().is_empty() {
+            return self.config.default_fee_bps;
+        }
+        if let Some(fee_bps) = self.fee_rate_cache.get(token_id) {
+            return *fee_bps;
+        }
+
+        match fetch_fee_rate_bps(&self.fee_rate_http, &self.config.api_base_url, token_id).await {
+            Ok(fee_bps) => {
+                self.fee_rate_cache.insert(token_id.to_owned(), fee_bps);
+                fee_bps
+            }
+            Err(error) => {
+                warn!(
+                    token_id,
+                    error = %error,
+                    fallback_fee_bps = self.config.default_fee_bps,
+                    "failed to fetch fee rate, using fallback"
+                );
+                self.config.default_fee_bps
+            }
+        }
     }
 }
 
@@ -1700,6 +1755,29 @@ fn incremental_fill_price(
     }
 }
 
+async fn fetch_fee_rate_bps(
+    http: &reqwest::Client,
+    api_base_url: &str,
+    token_id: &str,
+) -> Result<u32> {
+    let base_url = api_base_url.trim_end_matches('/');
+    let response = http
+        .get(format!("{base_url}/fee-rate"))
+        .query(&[("token_id", token_id)])
+        .send()
+        .await
+        .with_context(|| format!("failed to request fee rate for token `{token_id}`"))?;
+    let response = response
+        .error_for_status()
+        .with_context(|| format!("fee rate endpoint returned error for token `{token_id}`"))?;
+    let payload: Value = response
+        .json()
+        .await
+        .context("failed to decode fee rate response")?;
+    extract_fee_bps(&payload)
+        .with_context(|| format!("missing fee rate field in response for token `{token_id}`"))
+}
+
 fn estimate_fill_fee_from_transition(
     previous_detail: Option<&Value>,
     previous_filled: f64,
@@ -1723,6 +1801,17 @@ fn estimate_fill_fee_from_transition(
     }
     let delta_quantity = (current_filled - previous_filled).max(0.0);
     delta_quantity * current_average_fill_price * f64::from(fallback_fee_bps) / 10_000.0
+}
+
+fn fallback_fee_bps(
+    primary_detail: Option<&Value>,
+    secondary_detail: Option<&Value>,
+    default_fee_bps: u32,
+) -> u32 {
+    primary_detail
+        .and_then(extract_fee_bps)
+        .or_else(|| secondary_detail.and_then(extract_fee_bps))
+        .unwrap_or(default_fee_bps)
 }
 
 fn extract_total_fee(detail: &Value) -> Option<f64> {
@@ -1759,20 +1848,80 @@ fn extract_total_fee(detail: &Value) -> Option<f64> {
     None
 }
 
+fn extract_fee_bps(detail: &Value) -> Option<u32> {
+    const CANDIDATE_PATHS: [&[&str]; 10] = [
+        &["fee_bps"],
+        &["fee_rate_bps"],
+        &["feeRateBps"],
+        &["taker_fee_bps"],
+        &["maker_fee_bps"],
+        &["takerFeeBps"],
+        &["data", "fee_bps"],
+        &["data", "fee_rate_bps"],
+        &["data", "feeRateBps"],
+        &["data", "taker_fee_bps"],
+    ];
+    for path in CANDIDATE_PATHS {
+        let mut current = detail;
+        let mut found = true;
+        for key in path {
+            match current.get(*key) {
+                Some(next) => current = next,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found {
+            if let Some(value) = current.as_u64() {
+                return u32::try_from(value).ok();
+            }
+            if let Some(value) = current.as_i64() {
+                return u32::try_from(value).ok();
+            }
+            if let Some(value) = current.as_str().and_then(|item| item.parse::<u32>().ok()) {
+                return Some(value);
+            }
+            if let Some(value) = current.as_f64() {
+                if value >= 0.0 {
+                    return Some(value.round() as u32);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn with_fee_bps(detail: Value, fee_bps: u32) -> Value {
+    match detail {
+        Value::Object(mut map) => {
+            map.entry("fee_bps".to_owned()).or_insert(json!(fee_bps));
+            Value::Object(map)
+        }
+        other => json!({
+            "detail": other,
+            "fee_bps": fee_bps,
+        }),
+    }
+}
+
 fn local_naive_to_utc(timezone: Tz, local: chrono::NaiveDateTime) -> Result<DateTime<Utc>> {
     timezone
         .from_local_datetime(&local)
         .single()
         .map(|value| value.with_timezone(&Utc))
-        .ok_or_else(|| anyhow!("failed to resolve local datetime `{local}` in timezone `{timezone}`"))
+        .ok_or_else(|| {
+            anyhow!("failed to resolve local datetime `{local}` in timezone `{timezone}`")
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polymarket_core::{IntentPolicy, OptimizationStatus, RuntimeMode, StrategyKind};
     use polymarket_msgbus::MessageBus;
     use polymarket_storage::Store;
-    use polymarket_core::{IntentPolicy, OptimizationStatus, RuntimeMode, StrategyKind};
     use std::time::Duration;
 
     fn sample_intent(domain: AccountDomain) -> TradeIntent {
@@ -1787,6 +1936,7 @@ mod tests {
             expires_at: now() + chrono::Duration::seconds(30),
             strategy_kind: StrategyKind::DependencyArb,
             thesis_ref: "thesis".to_owned(),
+            research_ref: None,
             opportunity_id: Uuid::new_v4(),
             event_id: "evt-1".to_owned(),
         }
@@ -1817,8 +1967,8 @@ mod tests {
     #[test]
     fn live_runtime_requires_execute() {
         let domain = AccountDomain::Live;
-        let telegram = polymarket_config::TelegramConfig::from_map(&BTreeMap::new())
-            .expect("telegram config");
+        let telegram =
+            polymarket_config::TelegramConfig::from_map(&BTreeMap::new()).expect("telegram config");
         let notifier = crate::TelegramNotifier::from_config(&telegram).expect("notifier");
         let context = ServiceContext {
             domain,
@@ -1839,6 +1989,9 @@ mod tests {
                 runtime_mode: RuntimeMode::Observe,
             },
             telegram,
+            llm: polymarket_config::LlmConfig::from_map(&BTreeMap::new()).expect("llm config"),
+            search: polymarket_config::SearchConfig::from_map(&BTreeMap::new())
+                .expect("search config"),
             store: Store::new("./var/live/live.sqlite", domain, "live", "domain.live"),
             bus: polymarket_msgbus::MessageBus::new(16),
             audit: Arc::new(polymarket_audit::StorageAuditSink::new(Store::new(
@@ -1858,8 +2011,8 @@ mod tests {
         let db_path = std::env::temp_dir().join(format!("execution-{}.sqlite", Uuid::new_v4()));
         let store = Store::new(db_path.clone(), AccountDomain::Sim, "sim", "domain.sim");
         store.init().expect("store init");
-        let telegram = polymarket_config::TelegramConfig::from_map(&BTreeMap::new())
-            .expect("telegram config");
+        let telegram =
+            polymarket_config::TelegramConfig::from_map(&BTreeMap::new()).expect("telegram config");
         let notifier = crate::TelegramNotifier::from_config(&telegram).expect("notifier");
         let context = ServiceContext {
             domain: AccountDomain::Sim,
@@ -1867,6 +2020,9 @@ mod tests {
                 .expect("node config")
                 .selected_domain_config,
             telegram,
+            llm: polymarket_config::LlmConfig::from_map(&BTreeMap::new()).expect("llm config"),
+            search: polymarket_config::SearchConfig::from_map(&BTreeMap::new())
+                .expect("search config"),
             store: store.clone(),
             bus: MessageBus::new(16),
             audit: Arc::new(polymarket_audit::StorageAuditSink::new(store)),

@@ -6,4 +6,6 @@ pub enum OpportunityError {
     MissingBook(String),
     #[error("invalid scan input: {0}")]
     InvalidInput(String),
+    #[error("llm evaluation failed: {0}")]
+    Llm(String),
 }

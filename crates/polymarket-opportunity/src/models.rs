@@ -2,10 +2,12 @@ use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 
 use chrono::Utc;
+use polymarket_config::{LlmTaskKind, ModelTier, ResolvedLlmTaskConfig, SearchConfig};
 use polymarket_core::{
     now, AccountDomain, ConstraintGraphSnapshot, MarketCanonical, MarketSnapshot,
     OpportunityCandidate, OpportunityScore, ScannerRunReport, StrategyKind, Timestamp,
 };
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,74 @@ pub struct ScanContext {
     pub books: OrderbookSnapshotSet,
     pub health: RuntimeHealth,
     pub settings: ScanSettings,
+    pub llm: Option<LlmEvaluationConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmEvaluationConfig {
+    pub task: LlmTaskKind,
+    pub tier: ModelTier,
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model_name: String,
+    pub fallback_models: Vec<LlmFallbackConfig>,
+    pub max_candidates: usize,
+    pub veto_enabled: bool,
+    pub search: Option<SearchConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmFallbackConfig {
+    pub tier: ModelTier,
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model_name: String,
+}
+
+impl LlmEvaluationConfig {
+    pub fn from_resolved(
+        resolved: ResolvedLlmTaskConfig,
+        max_candidates: usize,
+        search: Option<SearchConfig>,
+        fallbacks: Vec<LlmFallbackConfig>,
+    ) -> Self {
+        Self {
+            task: resolved.task,
+            tier: resolved.tier,
+            provider: resolved.provider,
+            base_url: resolved.base_url,
+            api_key: resolved.api_key,
+            model_name: resolved.model_name,
+            fallback_models: fallbacks,
+            max_candidates,
+            veto_enabled: false,
+            search,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceEvidence {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+    pub source_domain: String,
+    pub published_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResearchEnvelope {
+    pub query: String,
+    pub generated_at: Timestamp,
+    pub summary: String,
+    pub risks: Vec<String>,
+    pub contradictions: Vec<String>,
+    pub evidence_gaps: Vec<String>,
+    pub confidence_note: String,
+    pub source_links: Vec<String>,
+    pub sources: Vec<SourceEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +229,8 @@ pub fn candidate_from_proposed(
         capital_lock_days: proposed.score.capital_lock_days,
         needs_multileg: proposed.needs_multileg,
         thesis_ref: proposed.thesis_ref,
+        research_ref: None,
+        llm_review: None,
         graph_version,
         book_observed_at: proposed.book_observed_at,
         created_at: now(),

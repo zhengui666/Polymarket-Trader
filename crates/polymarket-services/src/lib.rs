@@ -9,8 +9,8 @@ pub use execution::{
     run_execution_engine, ExecutionVenue, VenueHeartbeat, VenueOrderState, VenueSubmitAck,
 };
 pub use notifications::{
-    ClosePnlNotification, DailyReportNotification, Notifier, NotificationEvent, NotificationKind,
-    RiskAlertNotification, TelegramNotifier,
+    ClosePnlNotification, DailyReportNotification, NotificationEvent, NotificationKind,
+    NotificationRenderer, Notifier, RiskAlertNotification, TelegramNotifier,
 };
 pub use polymarket_config::SimConfig;
 pub use polymarket_core::{SimDriftReport, SimMode, SimRunReport};
@@ -36,8 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -45,37 +44,138 @@ use futures_util::{SinkExt, StreamExt};
 use polymarket_audit::{AuditSink, StorageAuditSink};
 use polymarket_common::{init_tracing, shutdown_signal};
 use polymarket_config::{
-    DomainConfig, MdGatewayConfig, MdGatewayMode, NodeConfig, OpportunityEngineConfig,
-    RiskEngineConfig, RulesEngineConfig, TelegramConfig,
+    DomainConfig, LlmConfig, LlmTaskKind, MdGatewayConfig, MdGatewayMode, NodeConfig,
+    OpportunityEngineConfig, RiskEngineConfig, RulesEngineConfig, SearchConfig, TelegramConfig,
 };
 use polymarket_core::{
     now, AccountDomain, ConstraintGraphSnapshot, DurableEvent, EventFamilySnapshot, GraphScope,
-    MarketBook, MarketDataChannel, MarketQuoteLevel, MarketSnapshot, MarketTrade,
-    MdGatewayCursor, MdGatewayRuntime, NewDurableEvent, NewStateSnapshot, PortfolioSnapshot,
-    RawMarketDocument, ReplayRequest, RiskBudgetSnapshot, RulesInvalidation,
-    RuntimeHealth as CoreRuntimeHealth, RuntimeMode, ServiceKind, StartupManifest,
-    StateSnapshot, StrategyKind, TradeIntentBatch, TradeSide,
+    MarketBook, MarketDataChannel, MarketQuoteLevel, MarketSnapshot, MarketTrade, MdGatewayCursor,
+    MdGatewayRuntime, NewDurableEvent, NewStateSnapshot, PortfolioSnapshot, RawMarketDocument,
+    ReplayRequest, RiskBudgetSnapshot, RulesInvalidation, RuntimeHealth as CoreRuntimeHealth,
+    RuntimeMode, ServiceKind, StartupManifest, StateSnapshot, StrategyKind, TradeIntentBatch,
+    TradeSide,
 };
 use polymarket_msgbus::MessageBus;
 use polymarket_opportunity::{
-    OpportunityEngine, OpportunityEngineService, OrderbookSnapshotSet,
+    LlmEvaluationConfig, OpportunityEngine, OpportunityEngineService, OrderbookSnapshotSet,
     RuntimeHealth as OpportunityRuntimeHealth, ScanContext, ScanSettings,
 };
 use polymarket_rules::{RulesEngine, RulesEngineService};
 use polymarket_storage::Store;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig as RustlsClientConfig, DigitallySignedStruct, SignatureScheme};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async, connect_async_tls_with_config, tungstenite::Message, Connector,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+#[derive(Debug)]
+struct InsecureServerCertVerifier {
+    supported_schemes: Vec<SignatureScheme>,
+}
+
+impl InsecureServerCertVerifier {
+    fn new() -> Self {
+        Self {
+            supported_schemes: vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::ED25519,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA512,
+            ],
+        }
+    }
+}
+
+impl ServerCertVerifier for InsecureServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported_schemes.clone()
+    }
+}
+
+fn allow_insecure_md_gateway_tls(domain: AccountDomain, config: &MdGatewayConfig) -> bool {
+    if !config.insecure_tls {
+        return false;
+    }
+    matches!(domain, AccountDomain::Sim | AccountDomain::Canary)
+}
+
+fn ensure_rustls_provider_installed() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+async fn connect_ws_stream(
+    url: &str,
+    allow_insecure_tls: bool,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    if !allow_insecure_tls {
+        let (stream, _) = connect_async(url).await?;
+        return Ok(stream);
+    }
+
+    ensure_rustls_provider_installed();
+    let client_config = RustlsClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(InsecureServerCertVerifier::new()))
+        .with_no_client_auth();
+    let connector = Connector::Rustls(Arc::new(client_config));
+    let (stream, _) = connect_async_tls_with_config(url, None, false, Some(connector)).await?;
+    Ok(stream)
+}
 
 #[derive(Clone)]
 pub struct ServiceContext {
     pub domain: AccountDomain,
     pub domain_config: DomainConfig,
     pub telegram: TelegramConfig,
+    pub llm: LlmConfig,
+    pub search: SearchConfig,
     pub store: Store,
     pub bus: MessageBus,
     pub audit: Arc<dyn AuditSink>,
@@ -179,6 +279,8 @@ impl NodeRuntime {
             domain: selected.domain(),
             domain_config: selected.clone(),
             telegram: self.config.telegram.clone(),
+            llm: self.config.llm.clone(),
+            search: self.config.search.clone(),
             store,
             bus: MessageBus::new(512),
             audit,
@@ -256,10 +358,10 @@ async fn run_service_loop(
         ServiceKind::SimEngine => run_sim_engine(context, cancellation).await,
         ServiceKind::ExecutionEngine => run_execution_engine(context, cancellation).await,
         ServiceKind::SettlementEngine => run_settlement_engine(context, cancellation).await,
-        _ => run_heartbeat_only_service(context, kind, cancellation).await,
     }
 }
 
+#[allow(dead_code)]
 async fn run_heartbeat_only_service(
     context: ServiceContext,
     kind: ServiceKind,
@@ -348,9 +450,11 @@ async fn run_md_gateway(context: ServiceContext, cancellation: CancellationToken
                 }
             }
         }
-        MdGatewayMode::Realtime => RealtimeMdGatewayProcessor::new(context, config)
-            .run(cancellation)
-            .await,
+        MdGatewayMode::Realtime => {
+            RealtimeMdGatewayProcessor::new(context, config)
+                .run(cancellation)
+                .await
+        }
     }
 }
 
@@ -456,10 +560,7 @@ impl ReplayMdGatewayProcessor {
 
     fn poll_once(&mut self) -> Result<()> {
         let mut file = File::open(&self.config.replay_input_path).with_context(|| {
-            format!(
-                "failed to open {}",
-                self.config.replay_input_path.display()
-            )
+            format!("failed to open {}", self.config.replay_input_path.display())
         })?;
         let current_len = file.metadata()?.len();
         if self.offset > current_len {
@@ -512,12 +613,7 @@ impl ReplayMdGatewayProcessor {
             }
         }
 
-        persist_md_gateway_runtime(
-            &self.context,
-            self.config.mode,
-            &self.runtime,
-            &self.stats,
-        )?;
+        persist_md_gateway_runtime(&self.context, self.config.mode, &self.runtime, &self.stats)?;
         Ok(())
     }
 
@@ -668,7 +764,7 @@ impl RealtimeMdGatewayProcessor {
                     maybe_message = async {
                         match user_stream.as_mut() {
                             Some(stream) => stream.next().await,
-                            None => None,
+                            None => std::future::pending().await,
                         }
                     } => {
                         if let Some(result) = maybe_message {
@@ -730,12 +826,12 @@ impl RealtimeMdGatewayProcessor {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     > {
-        let (mut stream, _) = connect_async(self.config.market_ws_url.as_str()).await?;
-        let asset_ids = self
-            .metadata_by_asset
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut stream = connect_ws_stream(
+            self.config.market_ws_url.as_str(),
+            allow_insecure_md_gateway_tls(self.context.domain, &self.config),
+        )
+        .await?;
+        let asset_ids = self.metadata_by_asset.keys().cloned().collect::<Vec<_>>();
         for chunk in asset_ids.chunks(self.config.market_subscription_chunk_size) {
             stream
                 .send(Message::Text(
@@ -769,8 +865,15 @@ impl RealtimeMdGatewayProcessor {
             .l2_credentials
             .resolve_string()?
             .ok_or_else(|| anyhow!("l2 credentials are required for realtime user channel"))?;
-        let credentials = parse_l2_credentials(&raw_credentials, self.context.domain_config.wallet_id.clone())?;
-        let (mut stream, _) = connect_async(self.config.user_ws_url.as_str()).await?;
+        let credentials = parse_l2_credentials(
+            &raw_credentials,
+            self.context.domain_config.wallet_id.clone(),
+        )?;
+        let mut stream = connect_ws_stream(
+            self.config.user_ws_url.as_str(),
+            allow_insecure_md_gateway_tls(self.context.domain, &self.config),
+        )
+        .await?;
         let markets = self
             .metadata_by_market
             .values()
@@ -799,13 +902,29 @@ impl RealtimeMdGatewayProcessor {
                 self.stats.market_messages += 1;
                 self.runtime.market_stream_connected = true;
                 self.runtime.last_market_event_at = Some(now());
-                for raw in decode_market_events(&text, &self.metadata_by_asset, &self.metadata_by_market) {
-                    let normalized = normalize_market_event(&raw, self.stats.market_messages)?;
-                    let payload = merged_market_payload(&raw, &normalized)?;
-                    publish_market_snapshot(&self.context, &normalized, payload, None)?;
-                    self.stats.processed += 1;
-                    if normalized.book.is_none() && normalized.status.is_none() {
-                        self.stats.stale += 1;
+                for raw in
+                    decode_market_events(&text, &self.metadata_by_asset, &self.metadata_by_market)
+                {
+                    match normalize_market_event(&raw, self.stats.market_messages) {
+                        Ok(normalized) => {
+                            let payload = merged_market_payload(&raw, &normalized)?;
+                            publish_market_snapshot(&self.context, &normalized, payload, None)?;
+                            self.stats.processed += 1;
+                            if normalized.book.is_none() && normalized.status.is_none() {
+                                self.stats.stale += 1;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                domain = %self.context.domain,
+                                market_id = %raw.market_id,
+                                channel = %raw.channel.as_str(),
+                                error = %error,
+                                "skipping malformed realtime market event"
+                            );
+                            self.stats.stale += 1;
+                            continue;
+                        }
                     }
                 }
             }
@@ -906,7 +1025,7 @@ fn normalize_market_event(raw: &RawMarketEvent, sequence: u64) -> Result<MarketS
     let best_bid = quote_level(raw.best_bid_price, raw.best_bid_size)?;
     let best_ask = quote_level(raw.best_ask_price, raw.best_ask_size)?;
 
-        let last_trade = match (raw.trade_price, raw.trade_size) {
+    let last_trade = match (raw.trade_price, raw.trade_size) {
         (Some(price), Some(size)) => Some(MarketTrade {
             price,
             size,
@@ -1074,10 +1193,7 @@ fn persist_md_gateway_runtime(
     Ok(())
 }
 
-fn parse_l2_credentials(
-    raw: &str,
-    wallet_id: Option<String>,
-) -> Result<MdGatewayL2Credentials> {
+fn parse_l2_credentials(raw: &str, wallet_id: Option<String>) -> Result<MdGatewayL2Credentials> {
     if let Ok(parsed) = serde_json::from_str::<Value>(raw.trim()) {
         let key = parsed
             .get("key")
@@ -1138,7 +1254,8 @@ fn parse_market_metadata(value: &Value) -> Option<MarketMetadata> {
     }
 
     let token_ids = parse_string_list(
-        value.get("clobTokenIds")
+        value
+            .get("clobTokenIds")
             .or_else(|| value.get("token_ids"))
             .or_else(|| value.get("tokenIds")),
     );
@@ -1211,14 +1328,13 @@ fn parse_string_list(value: Option<&Value>) -> Vec<String> {
             .iter()
             .filter_map(|item| item.as_str().map(ToOwned::to_owned))
             .collect(),
-        Some(Value::String(raw)) => serde_json::from_str::<Vec<String>>(raw)
-            .unwrap_or_else(|_| {
-                raw.split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect()
-            }),
+        Some(Value::String(raw)) => serde_json::from_str::<Vec<String>>(raw).unwrap_or_else(|_| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        }),
         _ => Vec::new(),
     }
 }
@@ -1276,7 +1392,11 @@ fn decode_market_event_value(
     let metadata = asset_id
         .as_ref()
         .and_then(|asset| metadata_by_asset.get(asset))
-        .or_else(|| market_key.as_ref().and_then(|market| metadata_by_market.get(market)))
+        .or_else(|| {
+            market_key
+                .as_ref()
+                .and_then(|market| metadata_by_market.get(market))
+        })
         .cloned()?;
     let best_bid_price = value
         .get("best_bid")
@@ -1538,6 +1658,32 @@ async fn process_opportunity_batch(
                     now: now(),
                 },
                 settings: settings.clone(),
+                llm: context
+                    .llm
+                    .resolve_task(LlmTaskKind::OpportunityReview)
+                    .map(|resolved| {
+                        let fallbacks = resolved
+                            .fallback_tiers
+                            .iter()
+                            .filter_map(|tier| {
+                                context.llm.profile_for_tier(*tier).map(|profile| {
+                                    polymarket_opportunity::LlmFallbackConfig {
+                                        tier: *tier,
+                                        provider: profile.provider,
+                                        base_url: profile.base_url,
+                                        api_key: profile.api_key,
+                                        model_name: profile.model_name,
+                                    }
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        LlmEvaluationConfig::from_resolved(
+                            resolved,
+                            8,
+                            context.search.enabled.then(|| context.search.clone()),
+                            fallbacks,
+                        )
+                    }),
             })
             .await?;
 
@@ -1697,38 +1843,44 @@ async fn process_portfolio_cycle(
 }
 
 fn load_runtime_health_snapshot(context: &ServiceContext) -> Result<CoreRuntimeHealth> {
-    Ok(match context
-        .store
-        .latest_snapshot(context.domain, "runtime_health", "latest")?
-    {
-        Some(snapshot) => snapshot_payload(&snapshot, "runtime health snapshot")?,
-        None => CoreRuntimeHealth {
-            domain: context.domain,
-            runtime_mode: context.domain_config.runtime_mode.as_str().to_owned(),
-            now: now(),
-            market_ws_lag_ms: 0,
-            user_ws_ok: true,
-            heartbeat_age_ms: 0,
-            recent_425_count: 0,
-            reject_rate_5m: 0.0,
-            reconcile_drift: false,
-            capital_buffer_ok: true,
-            fill_rate_5m: 1.0,
-            open_orders: 0,
-            reconcile_lag_ms: 0,
-            disputed_capital_ratio: 0.0,
-            degradation_reason: None,
-            last_alert_at: None,
-            stable_since: None,
-            shadow_live_drift_bps: None,
+    Ok(
+        match context
+            .store
+            .latest_snapshot(context.domain, "runtime_health", "latest")?
+        {
+            Some(snapshot) => snapshot_payload(&snapshot, "runtime health snapshot")?,
+            None => CoreRuntimeHealth {
+                domain: context.domain,
+                runtime_mode: context.domain_config.runtime_mode.as_str().to_owned(),
+                now: now(),
+                market_ws_lag_ms: 0,
+                user_ws_ok: true,
+                heartbeat_age_ms: 0,
+                recent_425_count: 0,
+                reject_rate_5m: 0.0,
+                reconcile_drift: false,
+                capital_buffer_ok: true,
+                fill_rate_5m: 1.0,
+                open_orders: 0,
+                reconcile_lag_ms: 0,
+                disputed_capital_ratio: 0.0,
+                degradation_reason: None,
+                last_alert_at: None,
+                stable_since: None,
+                shadow_live_drift_bps: None,
+            },
         },
-    })
+    )
 }
 
 fn derive_portfolio_snapshot(
     context: &ServiceContext,
     bootstrap_nav: f64,
 ) -> Result<PortfolioSnapshot> {
+    if context.domain == AccountDomain::Sim {
+        return derive_sim_portfolio_snapshot(context, bootstrap_nav);
+    }
+
     let intents = context.store.list_all_execution_intents(context.domain)?;
     let orders = context.store.list_all_order_lifecycle(context.domain)?;
     let mut intents_by_client = HashMap::new();
@@ -1759,7 +1911,9 @@ fn derive_portfolio_snapshot(
             .map(|item| item.token_id.clone())
             .unwrap_or_else(|| "unknown-token".to_owned());
         let rules_market = context.store.get_rules_market(&order.market_id)?;
-        let market_snapshot = context.store.get_market_snapshot(context.domain, &order.market_id)?;
+        let market_snapshot = context
+            .store
+            .get_market_snapshot(context.domain, &order.market_id)?;
         let event_id = intent
             .and_then(|item| item.batch_id.map(|batch_id| batch_id.to_string()))
             .or_else(|| rules_market.as_ref().map(|item| item.event_id.clone()))
@@ -1776,10 +1930,7 @@ fn derive_portfolio_snapshot(
             .unwrap_or(0.0);
 
         if !order.status.is_terminal() {
-            reserved_cash += order
-                .limit_price
-                .unwrap_or(0.0)
-                * order.order_quantity.unwrap_or(0.0);
+            reserved_cash += order.limit_price.unwrap_or(0.0) * order.order_quantity.unwrap_or(0.0);
         }
         if order.filled_quantity <= 0.0 {
             continue;
@@ -1806,9 +1957,7 @@ fn derive_portfolio_snapshot(
             .average_fill_price
             .unwrap_or(order.limit_price.unwrap_or(0.0))
             * order.filled_quantity;
-        entry.reserved_notional += order
-            .limit_price
-            .unwrap_or(0.0)
+        entry.reserved_notional += order.limit_price.unwrap_or(0.0)
             * (order.order_quantity.unwrap_or(0.0) - order.filled_quantity).max(0.0);
         if mark_price > 0.0 {
             entry.mark_price = mark_price;
@@ -1817,6 +1966,146 @@ fn derive_portfolio_snapshot(
 
     let positions = positions_by_key
         .into_values()
+        .map(|position| {
+            let average_price = if position.quantity.abs() > f64::EPSILON {
+                position.notional / position.quantity.abs()
+            } else {
+                0.0
+            };
+            let unrealized_pnl = (position.mark_price - average_price) * position.quantity;
+            polymarket_core::PositionSnapshot {
+                market_id: position.market_id,
+                token_id: position.token_id,
+                event_id: position.event_id,
+                category: position.category,
+                quantity: position.quantity,
+                average_price,
+                mark_price: position.mark_price,
+                reserved_notional: position.reserved_notional,
+                unrealized_pnl,
+            }
+        })
+        .collect::<Vec<_>>();
+    let invested_notional = positions
+        .iter()
+        .map(|position| position.quantity.abs() * position.average_price.abs())
+        .sum::<f64>();
+    let unresolved_capital = positions
+        .iter()
+        .map(|position| position.quantity.abs() * position.mark_price.abs())
+        .sum::<f64>();
+    let nav = bootstrap_nav
+        .max(invested_notional + reserved_cash + unresolved_capital)
+        .max(1.0);
+    let cash_available = (nav - invested_notional - reserved_cash).max(0.0);
+
+    Ok(PortfolioSnapshot {
+        nav,
+        cash_available,
+        reserved_cash,
+        positions,
+        unresolved_capital,
+        redeemable_capital: 0.0,
+    })
+}
+
+fn derive_sim_portfolio_snapshot(
+    context: &ServiceContext,
+    bootstrap_nav: f64,
+) -> Result<PortfolioSnapshot> {
+    #[derive(Default)]
+    struct AccumulatedPosition {
+        market_id: String,
+        token_id: String,
+        event_id: String,
+        category: String,
+        quantity: f64,
+        notional: f64,
+        reserved_notional: f64,
+        mark_price: f64,
+    }
+
+    let orders = context.store.list_all_sim_orders(context.domain)?;
+    let mut positions_by_key: HashMap<(String, String), AccumulatedPosition> = HashMap::new();
+    let mut reserved_cash = 0.0_f64;
+
+    for order in &orders {
+        let token_id = order
+            .detail
+            .get("token_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| order.market_id.clone());
+        let side = order
+            .detail
+            .get("side")
+            .and_then(Value::as_str)
+            .unwrap_or("BUY")
+            .to_ascii_uppercase();
+        let limit_price = order
+            .detail
+            .get("limit_price")
+            .and_then(Value::as_f64)
+            .or(order.average_fill_price)
+            .unwrap_or(0.0);
+        let order_quantity = order
+            .detail
+            .get("order_quantity")
+            .and_then(Value::as_f64)
+            .unwrap_or(order.filled_quantity);
+        let rules_market = context.store.get_rules_market(&order.market_id)?;
+        let market_snapshot = context
+            .store
+            .get_market_snapshot(context.domain, &order.market_id)?;
+        let event_id = rules_market
+            .as_ref()
+            .map(|item| item.event_id.clone())
+            .unwrap_or_else(|| "unknown-event".to_owned());
+        let category = rules_market
+            .as_ref()
+            .map(|item| item.category.clone())
+            .unwrap_or_else(|| "uncategorized".to_owned());
+        let mark_price = market_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.book.as_ref().and_then(|book| book.mid_price))
+            .or(order.average_fill_price)
+            .unwrap_or(limit_price);
+
+        if !order.status.is_terminal() {
+            reserved_cash += limit_price * order_quantity;
+        }
+        if order.filled_quantity <= 0.0 {
+            continue;
+        }
+
+        let signed_quantity = if side == "SELL" {
+            -order.filled_quantity
+        } else {
+            order.filled_quantity
+        };
+        let entry = positions_by_key
+            .entry((order.market_id.clone(), token_id.clone()))
+            .or_insert_with(|| AccumulatedPosition {
+                market_id: order.market_id.clone(),
+                token_id,
+                event_id,
+                category,
+                quantity: 0.0,
+                notional: 0.0,
+                reserved_notional: 0.0,
+                mark_price,
+            });
+        entry.quantity += signed_quantity;
+        entry.notional += limit_price * order.filled_quantity;
+        entry.reserved_notional += limit_price * (order_quantity - order.filled_quantity).max(0.0);
+        if mark_price > 0.0 {
+            entry.mark_price = mark_price;
+        }
+    }
+
+    let positions = positions_by_key
+        .into_values()
+        .filter(|position| position.quantity.abs() > f64::EPSILON)
         .map(|position| {
             let average_price = if position.quantity.abs() > f64::EPSILON {
                 position.notional / position.quantity.abs()
@@ -1888,7 +2177,10 @@ fn build_portfolio_inputs(
         let Some(rules_market) = context.store.get_rules_market(&market_id)? else {
             continue;
         };
-        let Some(snapshot) = context.store.get_market_snapshot(context.domain, &market_id)? else {
+        let Some(snapshot) = context
+            .store
+            .get_market_snapshot(context.domain, &market_id)?
+        else {
             continue;
         };
         let Some(book) = snapshot.book.as_ref() else {
@@ -1936,8 +2228,16 @@ fn build_portfolio_inputs(
 }
 
 fn estimate_orderbook_depth_score(book: &MarketBook) -> f64 {
-    let bid = book.best_bid.as_ref().map(|level| level.size).unwrap_or(0.0);
-    let ask = book.best_ask.as_ref().map(|level| level.size).unwrap_or(0.0);
+    let bid = book
+        .best_bid
+        .as_ref()
+        .map(|level| level.size)
+        .unwrap_or(0.0);
+    let ask = book
+        .best_ask
+        .as_ref()
+        .map(|level| level.size)
+        .unwrap_or(0.0);
     ((bid + ask) / 50.0).clamp(0.25, 1.25)
 }
 
@@ -2058,7 +2358,15 @@ async fn run_risk_engine(context: ServiceContext, cancellation: CancellationToke
                     if snapshot.version > last_batch_version {
                         let batch: TradeIntentBatch =
                             snapshot_payload(&snapshot, "trade intent batch")?;
-                        let evaluation = engine.evaluate_batch(batch, risk_context.clone()).await?;
+                        let evaluation = match engine.evaluate_batch(batch, risk_context.clone()).await {
+                            Ok(evaluation) => evaluation,
+                            Err(RiskError::EmptyBatch) => {
+                                warn!(domain = %context.domain, "risk engine skipped empty trade-intent batch");
+                                last_batch_version = snapshot.version;
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
                         persist_json_snapshot(&context, "risk_evaluation", "latest", &evaluation)?;
 
                         match &evaluation {
@@ -2120,21 +2428,17 @@ async fn run_risk_engine(context: ServiceContext, cancellation: CancellationToke
 }
 
 fn load_severe_risk_alert_keys(context: &ServiceContext) -> Result<BTreeSet<String>> {
-    let snapshot = context.store.latest_snapshot(
-        context.domain,
-        "severe_risk_alert_keys",
-        "current",
-    )?;
+    let snapshot =
+        context
+            .store
+            .latest_snapshot(context.domain, "severe_risk_alert_keys", "current")?;
     Ok(match snapshot {
         Some(snapshot) => snapshot_payload(&snapshot, "severe risk alert keys")?,
         None => BTreeSet::new(),
     })
 }
 
-fn store_severe_risk_alert_keys(
-    context: &ServiceContext,
-    keys: &BTreeSet<String>,
-) -> Result<()> {
+fn store_severe_risk_alert_keys(context: &ServiceContext, keys: &BTreeSet<String>) -> Result<()> {
     context.store.upsert_snapshot(NewStateSnapshot {
         domain: context.domain,
         aggregate_type: "severe_risk_alert_keys".to_owned(),
@@ -2360,7 +2664,9 @@ fn load_risk_context(context: &ServiceContext) -> Result<Option<RiskContext>> {
             .store
             .get_current_rollout_stage(context.domain)?
             .map(|record| record.stage),
-        rollout_policy: context.store.load_effective_rollout_policy(context.domain)?,
+        rollout_policy: context
+            .store
+            .load_effective_rollout_policy(context.domain)?,
     }))
 }
 
@@ -2536,6 +2842,62 @@ fn publish_opportunity_candidate(
         "opportunity.candidate.upserted",
         serde_json::to_string(candidate)?,
     );
+    persist_research_asset(context, candidate)?;
+    Ok(())
+}
+
+fn persist_research_asset(
+    context: &ServiceContext,
+    candidate: &polymarket_core::OpportunityCandidate,
+) -> Result<()> {
+    let (Some(research_ref), Some(llm_review)) = (&candidate.research_ref, &candidate.llm_review)
+    else {
+        return Ok(());
+    };
+    let payload = json!({
+        "research_ref": research_ref,
+        "event_id": candidate.event_id,
+        "opportunity_id": candidate.opportunity_id,
+        "thesis_ref": candidate.thesis_ref,
+        "captured_at": candidate.created_at,
+        "llm_review": llm_review,
+        "research": llm_review.get("research").cloned(),
+    });
+    context.store.append_event(NewDurableEvent {
+        domain: context.domain,
+        stream: format!("research:{}", research_ref),
+        aggregate_type: "research_asset".to_owned(),
+        aggregate_id: research_ref.clone(),
+        event_type: "research.asset.upserted".to_owned(),
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: None,
+        payload: payload.clone(),
+        metadata: json!({
+            "event_id": candidate.event_id,
+            "opportunity_id": candidate.opportunity_id,
+        }),
+        created_at: now(),
+    })?;
+    context.store.upsert_snapshot(NewStateSnapshot {
+        domain: context.domain,
+        aggregate_type: "research_asset".to_owned(),
+        aggregate_id: research_ref.clone(),
+        version: candidate.created_at.timestamp(),
+        payload,
+        derived_from_sequence: None,
+        created_at: now(),
+    })?;
+    context.bus.publish(
+        ServiceKind::OpportunityEngine,
+        context.domain,
+        "research.asset.upserted",
+        serde_json::to_string(&json!({
+            "research_ref": research_ref,
+            "event_id": candidate.event_id,
+            "opportunity_id": candidate.opportunity_id,
+        }))?,
+    );
     Ok(())
 }
 
@@ -2648,6 +3010,9 @@ fn publish_constraint_graph(
     context: &ServiceContext,
     snapshot: &ConstraintGraphSnapshot,
 ) -> Result<()> {
+    context
+        .store
+        .upsert_constraint_graph_snapshot(snapshot.clone())?;
     let aggregate_id = match &snapshot.scope {
         GraphScope::All => "ALL".to_owned(),
         GraphScope::Event { event_id } => event_id.clone(),

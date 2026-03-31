@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,12 +6,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use polymarket_config::SimConfig;
 use polymarket_core::{
-    now, AccountDomain, ExecutionError, ExecutionIntentRecord, NewReplayCheckpoint, NewSimEvent,
-    NewSimFillRecord, NewSimOrderRecord, OrderLifecycleRecord, OrderLifecycleStatus, ReplayCursor,
-    SimDriftReport, SimDriftSeverity, SimEventKind, SimEventRecord, SimFillRecord, SimMode,
-    SimOrderRecord, SimRunReport,
+    now, AccountDomain, ExecutionError, ExecutionIntentRecord, MarketSnapshot, NewReplayCheckpoint,
+    NewSimEvent, NewSimFillRecord, NewSimOrderRecord, OrderLifecycleRecord, OrderLifecycleStatus,
+    ReplayCursor, SimDriftReport, SimDriftSeverity, SimEventKind, SimFillRecord, SimMode,
+    SimRunReport, TradeIntent, TradeIntentBatch,
 };
-use polymarket_msgbus::MessageBus;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::select;
@@ -20,6 +18,10 @@ use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+use crate::ApprovedTradeIntentBatch;
+
+const TOPIC_APPROVED_INTENT: &str = "trade.intent.approved";
 
 use crate::execution::{ExecutionVenue, VenueHeartbeat, VenueOrderState, VenueSubmitAck};
 use crate::ServiceContext;
@@ -171,6 +173,11 @@ impl SimExchangeAdapter {
             "latency_ms": self.latency_model.latency_ms,
             "fees_paid": fees_paid,
             "queue_depth": self.queue_model.depth,
+            "side": request.side,
+            "limit_price": request.limit_price,
+            "order_quantity": request.quantity,
+            "book_price": request.book_price,
+            "available_quantity": request.available_quantity,
         });
         let ack = VenueSubmitAck {
             order_id: request.order_id.clone(),
@@ -601,7 +608,7 @@ impl SimEngineService {
                         mode,
                         event_kind: classify_topic(&envelope.topic),
                         event_time: envelope.emitted_at,
-                        market_id: None,
+                        market_id: extract_market_id(&envelope.payload),
                         payload: json!({
                             "topic": envelope.topic,
                             "payload": envelope.payload,
@@ -610,24 +617,25 @@ impl SimEngineService {
                     })?;
                     self.context.bus.publish_sim_event(self.context.domain, &sim_event)?;
 
-                    let request = SimulatedOrderRequest {
-                        order_id: Uuid::new_v4().to_string(),
-                        client_order_id: Some(format!("{mode}-{processed}")),
-                        market_id: "shadow-market".to_owned(),
-                        side: "BUY".to_owned(),
-                        limit_price: 0.51,
-                        quantity: 10.0,
-                        book_price: 0.52,
-                        available_quantity: 10.0,
-                        post_only: false,
-                        fok: false,
-                        fak: mode == SimMode::PaperLiveQueue,
-                        expires_at_ms: None,
-                        now_ms: envelope.emitted_at.timestamp_millis(),
-                        leg_count: 1,
-                        failing_leg_index: None,
+                    let requests = build_requests_from_envelope(&envelope, mode, processed);
+                    if requests.is_empty() {
+                        continue;
+                    }
+                    for request in requests {
+                    let outcome = match self.adapter.simulate_order(&request) {
+                        Ok(outcome) => outcome,
+                        Err(ExecutionError::VenueRestart(detail)) => {
+                            warn!(
+                                domain = %self.context.domain,
+                                mode = %mode,
+                                market_id = %request.market_id,
+                                detail = %detail,
+                                "sim order skipped during maintenance window"
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
                     };
-                    let outcome = self.adapter.simulate_order(&request)?;
                     let order = self.context.store.record_sim_order_state(NewSimOrderRecord {
                         domain: self.context.domain,
                         run_id,
@@ -664,6 +672,7 @@ impl SimEngineService {
                         })?;
                         fills += 1;
                         self.context.bus.publish_sim_fill(self.context.domain, &fill)?;
+                    }
                     }
                 }
             }
@@ -705,6 +714,110 @@ impl SimEngineService {
             .publish_sim_report(self.context.domain, &report)?;
         Ok(())
     }
+}
+
+fn build_requests_from_envelope(
+    envelope: &polymarket_msgbus::EventEnvelope,
+    mode: SimMode,
+    processed: u64,
+) -> Vec<SimulatedOrderRequest> {
+    if envelope.topic == TOPIC_APPROVED_INTENT {
+        return parse_trade_intent_batch(&envelope.payload)
+            .map(|batch| {
+                batch
+                    .intents
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, intent)| {
+                        build_request_from_trade_intent(intent, mode, processed + offset as u64)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    if !envelope.topic.starts_with("market_data.") {
+        return Vec::new();
+    }
+
+    let Some(snapshot) = serde_json::from_str::<MarketSnapshot>(&envelope.payload).ok() else {
+        return Vec::new();
+    };
+    let Some(book) = snapshot.book else {
+        return Vec::new();
+    };
+    let market_id = snapshot.market_id;
+    let observed_at = book.observed_at.timestamp_millis();
+
+    let (side, limit_price, book_price, available_quantity) = if let Some(ask) = book.best_ask {
+        ("BUY".to_owned(), ask.price, ask.price, ask.size)
+    } else if let Some(bid) = book.best_bid {
+        ("SELL".to_owned(), bid.price, bid.price, bid.size)
+    } else if let Some(trade) = book.last_trade {
+        (
+            trade.side.unwrap_or_else(|| "BUY".to_owned()),
+            trade.price,
+            trade.price,
+            trade.size,
+        )
+    } else {
+        return Vec::new();
+    };
+
+    let quantity = available_quantity.min(10.0).max(1.0);
+    vec![SimulatedOrderRequest {
+        order_id: Uuid::new_v4().to_string(),
+        client_order_id: Some(format!("{mode}-{processed}-{market_id}")),
+        market_id,
+        side,
+        limit_price,
+        quantity,
+        book_price,
+        available_quantity,
+        post_only: false,
+        fok: false,
+        fak: mode == SimMode::PaperLiveQueue,
+        expires_at_ms: None,
+        now_ms: observed_at.max(envelope.emitted_at.timestamp_millis()),
+        leg_count: 1,
+        failing_leg_index: None,
+    }]
+}
+
+fn build_request_from_trade_intent(
+    intent: TradeIntent,
+    mode: SimMode,
+    processed: u64,
+) -> SimulatedOrderRequest {
+    SimulatedOrderRequest {
+        order_id: Uuid::new_v4().to_string(),
+        client_order_id: Some(format!("{mode}-{processed}-{}", intent.market_id)),
+        market_id: intent.market_id,
+        side: intent.side.as_str().to_owned(),
+        limit_price: intent.limit_price,
+        quantity: intent.max_size,
+        book_price: intent.limit_price,
+        available_quantity: intent.max_size,
+        post_only: false,
+        fok: false,
+        fak: mode == SimMode::PaperLiveQueue,
+        expires_at_ms: Some(intent.expires_at.timestamp_millis()),
+        now_ms: now().timestamp_millis(),
+        leg_count: 1,
+        failing_leg_index: None,
+    }
+}
+
+fn parse_trade_intent_batch(payload: &str) -> Option<TradeIntentBatch> {
+    if let Ok(approved) = serde_json::from_str::<ApprovedTradeIntentBatch>(payload) {
+        return Some(approved.batch);
+    }
+    serde_json::from_str::<TradeIntentBatch>(payload).ok()
+}
+
+fn extract_market_id(payload: &str) -> Option<String> {
+    serde_json::from_str::<MarketSnapshot>(payload)
+        .ok()
+        .map(|snapshot| snapshot.market_id)
 }
 
 pub async fn run_sim_engine(
@@ -772,6 +885,8 @@ fn build_drift_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polymarket_core::{MarketBook, MarketDataChannel, MarketQuoteLevel, ServiceKind};
+    use polymarket_msgbus::EventEnvelope;
 
     fn base_request() -> SimulatedOrderRequest {
         SimulatedOrderRequest {
@@ -864,5 +979,88 @@ mod tests {
         request.failing_leg_index = Some(1);
         let outcome = adapter.simulate_order(&request).expect("simulate order");
         assert_eq!(outcome.state.status, OrderLifecycleStatus::Rejected);
+    }
+
+    #[test]
+    fn builds_request_from_realtime_snapshot_using_real_market_context() {
+        let snapshot = MarketSnapshot {
+            market_id: "real-market-123".to_owned(),
+            channel: MarketDataChannel::Market,
+            status: Some("ACTIVE".to_owned()),
+            book: Some(MarketBook {
+                best_bid: Some(MarketQuoteLevel {
+                    price: 0.47,
+                    size: 12.0,
+                }),
+                best_ask: Some(MarketQuoteLevel {
+                    price: 0.48,
+                    size: 7.5,
+                }),
+                last_trade: None,
+                mid_price: Some(0.475),
+                spread_bps: Some(210.0),
+                observed_at: now(),
+            }),
+            sequence: 42,
+            source_event_id: Some("evt-42".to_owned()),
+            observed_at: now(),
+            received_at: now(),
+        };
+        let envelope = EventEnvelope {
+            emitted_at: now(),
+            service: ServiceKind::MdGateway,
+            domain: AccountDomain::Sim,
+            topic: "market_data.market".to_owned(),
+            payload: serde_json::to_string(&snapshot).expect("snapshot json"),
+        };
+
+        let request = build_requests_from_envelope(&envelope, SimMode::PaperLiveQueue, 9)
+            .into_iter()
+            .next()
+            .expect("request should be built");
+
+        assert_eq!(request.market_id, "real-market-123");
+        assert_eq!(request.side, "BUY");
+        assert!((request.limit_price - 0.48).abs() < 1e-9);
+        assert!((request.book_price - 0.48).abs() < 1e-9);
+        assert!((request.available_quantity - 7.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn approved_intent_envelope_builds_sim_requests() {
+        let batch = TradeIntentBatch {
+            account_domain: AccountDomain::Sim,
+            created_at: now(),
+            optimization_status: polymarket_core::OptimizationStatus::Optimal,
+            intents: vec![TradeIntent {
+                account_domain: AccountDomain::Sim,
+                market_id: "market-approved".to_owned(),
+                token_id: "token-approved".to_owned(),
+                side: polymarket_core::TradeSide::Buy,
+                limit_price: 0.41,
+                max_size: 12.0,
+                policy: polymarket_core::IntentPolicy::Passive,
+                expires_at: now(),
+                strategy_kind: polymarket_core::StrategyKind::DependencyArb,
+                thesis_ref: "thesis-approved".to_owned(),
+                research_ref: Some("research:evt:1".to_owned()),
+                opportunity_id: Uuid::new_v4(),
+                event_id: "evt-approved".to_owned(),
+            }],
+        };
+        let envelope = EventEnvelope {
+            emitted_at: now(),
+            service: ServiceKind::RiskEngine,
+            domain: AccountDomain::Sim,
+            topic: TOPIC_APPROVED_INTENT.to_owned(),
+            payload: serde_json::to_string(&batch).expect("batch json"),
+        };
+
+        let requests = build_requests_from_envelope(&envelope, SimMode::PaperLiveQueue, 7);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].market_id, "market-approved");
+        assert_eq!(requests[0].side, "BUY");
+        assert_eq!(requests[0].quantity, 12.0);
+        assert!(requests[0].fak);
     }
 }
